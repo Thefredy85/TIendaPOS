@@ -1,0 +1,55 @@
+{
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devPath": "../src",
+    "distDir": "../src",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "Tienda POS",
+    "version": "0.1.1"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": ["msi", "nsis", "updater"],
+      "identifier": "com.tienda.pos.desktop",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.ico"
+      ]
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/Thefredy85/TiendaPOS/releases/latest/download/latest.json"
+      ],
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1NDUwNjY0RDc4MThGNkEKUldScWo0SFhaQVpGVmVrcnAzN1RsMVpjMHZLSjM3QXdDQ3pGemU2UHczdWFGakp2T3ZRclAwTDAK"
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "Tienda POS",
+        "width": 1400,
+        "height": 880,
+        "minWidth": 1024,
+        "minHeight": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}

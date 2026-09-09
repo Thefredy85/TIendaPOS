@@ -1,0 +1,40 @@
+name: Publicar version
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publicar:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Preparar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Instalar Tauri CLI
+        run: npm install -g @tauri-apps/cli@1
+
+      - name: Compilar y publicar
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Version ${{ github.ref_name }}"
+          releaseBody: "Actualizacion publicada automaticamente desde GitHub Actions."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
