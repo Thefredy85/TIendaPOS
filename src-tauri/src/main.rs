@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![recursion_limit = "256"]
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection};
@@ -11,6 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 const IVA_RATE: f64 = 0.16;
+
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
 
 #[derive(Clone)]
 struct Session {
@@ -272,7 +281,7 @@ fn normalize_settings(source: &Value) -> Value {
         "bg": color_or(g("bg"), "#f2f4f1"),
         "panel": color_or(g("panel"), "#fffefb"),
         "soft": color_or(g("soft"), "#f8f1e7"),
-        "confirmPayLabel": text_or("confirmPayLabel", "Confirmar cobro y descontar inventario"),
+        "confirmPayLabel": text_or("confirmPayLabel", "Cobrar"),
         "ticketTitle": text_or("ticketTitle", "Ticket de venta"),
         "ticketFooter": text_or("ticketFooter", "Gracias por su compra"),
         "ticketTaxLabel": text_or("ticketTaxLabel", "IVA 16%"),
@@ -297,7 +306,19 @@ fn normalize_settings(source: &Value) -> Value {
         "cashCutBold": not_false(g("cashCutBold")),
         "cashCutShowLogo": truthy_opt(g("cashCutShowLogo")),
         "cashCutShowProducts": not_false(g("cashCutShowProducts")),
-        "cashCutShowPayments": not_false(g("cashCutShowPayments"))
+        "cashCutShowPayments": not_false(g("cashCutShowPayments")),
+        "cashCutGroupBy": ({ let v = clean_text(g("cashCutGroupBy")); if ["normal","categoria","proveedor"].contains(&v.as_str()) { v } else { "normal".to_string() } }),
+        "enabledPaymentMethods": ({
+            let epm = g("enabledPaymentMethods");
+            let get_flag = |key: &str| -> bool {
+                epm.and_then(|m| m.get(key)).and_then(|v| v.as_bool()).unwrap_or(true)
+            };
+            let mut efectivo = get_flag("Efectivo");
+            let tarjeta = get_flag("Tarjeta");
+            let transferencia = get_flag("Transferencia");
+            if !efectivo && !tarjeta && !transferencia { efectivo = true; }
+            json!({"Efectivo": efectivo, "Tarjeta": tarjeta, "Transferencia": transferencia})
+        })
     })
 }
 
@@ -431,6 +452,199 @@ fn verify_supervisor(conn: &Connection, input: &Value) -> Result<Value, String> 
     Ok(user)
 }
 
+// ---------- actualizacion propia (reemplaza el updater basico de Tauri) ----------
+
+const APP_UPDATE_MANIFEST_URL: &str = "https://github.com/Thefredy85/TiendaPOS/releases/latest/download/latest.json";
+
+fn parse_version(v: &str) -> (u32, u32, u32) {
+    let mut parts = v.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+fn is_newer(candidate: &str, current: &str) -> bool {
+    parse_version(candidate) > parse_version(current)
+}
+
+#[tauri::command]
+fn check_for_update(app: tauri::AppHandle) -> Value {
+    let current_version = app.package_info().version.to_string();
+    let resp = match http_client().get(APP_UPDATE_MANIFEST_URL).send() {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e.to_string()}),
+    };
+    let manifest: Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => return json!({"ok": false, "error": e.to_string()}),
+    };
+    let latest_version = clean_text(manifest.get("version"));
+    let notes = clean_text(manifest.get("notes"));
+    let url = manifest
+        .get("platforms")
+        .and_then(|p| p.get("windows-x86_64"))
+        .and_then(|w| w.get("url"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let available = !latest_version.is_empty() && is_newer(&latest_version, &current_version);
+    json!({
+        "ok": true,
+        "available": available,
+        "currentVersion": current_version,
+        "latestVersion": latest_version,
+        "url": url,
+        "notes": notes
+    })
+}
+
+#[tauri::command]
+fn download_and_launch_update(url: String) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("No hay una URL de actualizacion valida".into());
+    }
+    let download_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let bytes = download_client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("No se pudo descargar la actualizacion: {}", e))?
+        .bytes()
+        .map_err(|e| format!("No se pudo leer la actualizacion descargada: {}", e))?;
+    let filename = url.rsplit('/').next().unwrap_or("Actualizacion_TiendaPOS.exe");
+    let mut path = std::env::temp_dir();
+    path.push(filename);
+    std::fs::write(&path, &bytes).map_err(|e| format!("No se pudo guardar el instalador: {}", e))?;
+    std::process::Command::new(&path)
+        .spawn()
+        .map_err(|e| format!("No se pudo abrir el instalador: {}", e))?;
+    std::process::exit(0);
+}
+
+// ---------- licencia / suscripcion ----------
+
+// Reemplaza esta URL por el link de "publicar en la web" (formato CSV) de tu
+// Google Sheet de licencias, con columnas: license_key, estado (activo/suspendido)
+const LICENSE_SHEET_URL: &str = "REEMPLAZAR_CON_TU_URL_DE_HOJA_PUBLICADA_CSV";
+const LICENSE_GRACE_DAYS: i64 = 7;
+
+fn get_or_create_license_key(conn: &Connection) -> String {
+    if let Some(row) = get_item(conn, "license", "local") {
+        let existing = clean_text(row.get("licenseKey"));
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+    let raw = random_text();
+    let key = format!("TP-{}", raw.chars().take(8).collect::<String>().to_uppercase());
+    create_item(
+        conn,
+        "license",
+        "local",
+        &json!({"licenseKey": key, "lastStatus": "desconocido", "lastOkIso": ""}),
+    )
+    .ok();
+    key
+}
+
+fn fetch_license_status(license_key: &str) -> Result<Option<String>, String> {
+    if LICENSE_SHEET_URL.starts_with("REEMPLAZAR_") {
+        return Err("La hoja de licencias todavia no esta configurada".into());
+    }
+    let text = http_client()
+        .get(LICENSE_SHEET_URL)
+        .send()
+        .map_err(|e| e.to_string())?
+        .text()
+        .map_err(|e| e.to_string())?;
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| "Hoja de licencias vacia".to_string())?;
+    let headers: Vec<String> = header
+        .split(',')
+        .map(|h| h.trim().trim_matches('"').to_lowercase())
+        .collect();
+    let key_idx = headers.iter().position(|h| h == "license_key" || h == "llave_licencia");
+    let status_idx = headers.iter().position(|h| h == "estado");
+    let (key_idx, status_idx) = match (key_idx, status_idx) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Err("La hoja de licencias no tiene las columnas esperadas".into()),
+    };
+    for line in lines {
+        let cols: Vec<String> = line.split(',').map(|c| c.trim().trim_matches('"').to_string()).collect();
+        if cols.len() <= key_idx.max(status_idx) {
+            continue;
+        }
+        if cols[key_idx] == license_key {
+            return Ok(Some(cols[status_idx].to_lowercase()));
+        }
+    }
+    Ok(None)
+}
+
+fn days_between_now_and(iso: &str) -> i64 {
+    if iso.is_empty() {
+        return i64::MAX;
+    }
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(then) => {
+            let now = Utc::now();
+            (now.signed_duration_since(then.with_timezone(&Utc))).num_days()
+        }
+        Err(_) => i64::MAX,
+    }
+}
+
+#[tauri::command]
+fn check_license(db: tauri::State<DbConn>) -> Value {
+    let conn = match db.0.lock() {
+        Ok(c) => c,
+        Err(_) => return json!({"ok": false, "error": "Error de base de datos local"}),
+    };
+    let key = get_or_create_license_key(&conn);
+    match fetch_license_status(&key) {
+        Ok(Some(status)) => {
+            let now_iso_val = now_iso();
+            patch_item(&conn, "license", "local", &json!({"lastStatus": status, "lastOkIso": now_iso_val})).ok();
+            json!({"ok": true, "licenseKey": key, "status": status, "online": true})
+        }
+        Ok(None) => {
+            json!({"ok": true, "licenseKey": key, "status": "no_registrada", "online": true})
+        }
+        Err(_) => {
+            let row = get_item(&conn, "license", "local").unwrap_or_else(|| json!({}));
+            let last_status = clean_text(row.get("lastStatus"));
+            let last_ok = clean_text(row.get("lastOkIso"));
+            json!({"ok": true, "licenseKey": key, "status": if last_status.is_empty() {"desconocido".to_string()} else {last_status}, "online": false, "lastOkIso": last_ok})
+        }
+    }
+}
+
+fn ensure_license_allows_sale(conn: &Connection) -> Result<(), String> {
+    let row = get_item(conn, "license", "local").unwrap_or_else(|| json!({}));
+    let last_status = clean_text(row.get("lastStatus"));
+    let last_ok = clean_text(row.get("lastOkIso"));
+    if last_status == "suspendido" {
+        return Err(
+            "Cuenta suspendida por falta de pago. Contacta a tu proveedor para reactivar el punto de venta.".into(),
+        );
+    }
+    // Si todavia nunca se ha logrado confirmar la licencia (por ejemplo,
+    // recien instalada sin internet la primera vez), no bloqueamos --
+    // el limite de 7 dias solo aplica despues de haber confirmado al menos
+    // una vez y luego perder la conexion.
+    if !last_ok.is_empty() && days_between_now_and(&last_ok) > LICENSE_GRACE_DAYS {
+        return Err(
+            "No se ha podido confirmar tu licencia en mas de 7 dias. Conecta la computadora a internet para reactivar las ventas.".into(),
+        );
+    }
+    Ok(())
+}
+
 // ---------- operaciones ----------
 
 fn op_bootstrap(conn: &Connection) -> Result<Value, String> {
@@ -513,19 +727,92 @@ fn op_data(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &s
     let products = list_items(conn, "products");
     let moves = if manager { list_items(conn, "moves") } else { vec![] };
     let counts = if manager { list_items(conn, "counts") } else { vec![] };
-    let sales = if manager { list_items(conn, "sales") } else { vec![] };
+    let sales = list_items(conn, "sales");
     let settings = read_settings(conn);
     let categories = list_items(conn, "categories");
     let units = list_items(conn, "units");
     let suppliers = list_items(conn, "suppliers");
     let presentations = list_items(conn, "presentations");
     let users: Vec<Value> = if admin { list_items(conn, "users").iter().map(public_user).collect() } else { vec![] };
+    let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"periodStart": "", "openingAmount": 0.0, "isOpen": false}));
+    let cash_cuts = list_items(conn, "cash_cuts");
     Ok(json!({
         "ok": true, "user": public_user(&user), "products": products, "moves": moves,
         "counts": counts, "sales": sales, "users": users, "settings": settings,
-        "categories": categories, "units": units, "suppliers": suppliers, "presentations": presentations
+        "categories": categories, "units": units, "suppliers": suppliers, "presentations": presentations,
+        "cashState": cash_state, "cashCuts": cash_cuts
     }))
 }
+
+fn op_open_cash_register(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    assert_role(&user, &["admin", "encargado", "cajero"])?;
+    let existing_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
+    if existing_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err("La caja ya esta abierta. Genera un Corte Z antes de abrir un turno nuevo.".into());
+    }
+    let opening = num_of(payload.get("openingAmount"));
+    let now = now_iso();
+    let state_rec = json!({"periodStart": now, "openingAmount": opening, "isOpen": true});
+    create_item(conn, "cash_state", "current", &state_rec)?;
+    let id = format!("APER-{}-{}", now_millis(), random_suffix());
+    let hist = json!({
+        "id": id, "type": "apertura", "timestamp": now, "periodStart": now, "periodEnd": now,
+        "openingAmount": opening, "total": 0.0, "salesCount": 0, "payments": json!({}),
+        "user": display_or_username(&user), "notes": clean_text(payload.get("notes"))
+    });
+    create_item(conn, "cash_cuts", &id, &hist)?;
+    Ok(json!({"ok": true, "cashState": state_rec, "cut": hist}))
+}
+
+fn op_cash_cut(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    assert_role(&user, &["admin", "encargado", "cajero"])?;
+    let cut_type = clean_text(payload.get("type"));
+    if !["x", "z"].contains(&cut_type.as_str()) {
+        return Err("Tipo de corte no reconocido".into());
+    }
+    let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
+    if !cash_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err("No hay una caja abierta. Abre la caja antes de generar un corte.".into());
+    }
+    let period_start = clean_text(cash_state.get("periodStart"));
+    let opening = num_of(cash_state.get("openingAmount"));
+    let now = now_iso();
+    let sales = list_items(conn, "sales");
+    let period_sales: Vec<&Value> = sales
+        .iter()
+        .filter(|s| period_start.is_empty() || clean_text(s.get("timestamp")) >= period_start)
+        .collect();
+    let total: f64 = period_sales.iter().map(|s| num_of(s.get("total"))).sum();
+    let mut by_payment: HashMap<String, f64> = HashMap::new();
+    for s in &period_sales {
+        if let Some(breakdown) = s.get("paymentBreakdown").and_then(|v| v.as_object()) {
+            if !breakdown.is_empty() {
+                for (k, v) in breakdown {
+                    *by_payment.entry(k.clone()).or_insert(0.0) += v.as_f64().unwrap_or(0.0);
+                }
+                continue;
+            }
+        }
+        let pay = { let p = clean_text(s.get("paymentMethod")); if p.is_empty() { "Efectivo".to_string() } else { p } };
+        *by_payment.entry(pay).or_insert(0.0) += num_of(s.get("total"));
+    }
+    let id = format!("{}-{}-{}", if cut_type == "z" { "CORTEZ" } else { "CORTEX" }, now_millis(), random_suffix());
+    let hist = json!({
+        "id": id, "type": cut_type, "timestamp": now, "periodStart": period_start, "periodEnd": now,
+        "openingAmount": opening, "total": total, "salesCount": period_sales.len(),
+        "payments": json!(by_payment),
+        "user": display_or_username(&user), "notes": clean_text(payload.get("notes"))
+    });
+    create_item(conn, "cash_cuts", &id, &hist)?;
+    if cut_type == "z" {
+        let new_state = json!({"periodStart": "", "openingAmount": 0.0, "isOpen": false});
+        create_item(conn, "cash_state", "current", &new_state)?;
+    }
+    Ok(json!({"ok": true, "cut": hist}))
+}
+
 
 fn op_save_user(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
@@ -836,6 +1123,11 @@ fn op_count(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &
 fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
     assert_role(&user, &["admin", "encargado", "cajero"])?;
+    ensure_license_allows_sale(conn)?;
+    let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
+    if !cash_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err("Debes abrir la caja antes de la primera venta. Indica el fondo inicial para comenzar.".into());
+    }
     let items = payload.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     if items.is_empty() { return Err("Ticket vacio".into()); }
     let products = list_items(conn, "products");
@@ -863,6 +1155,28 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     }
     let discount = 0.0;
     let total = subtotal;
+    let payments_input = payload.get("payments").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let mut payment_breakdown: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut payments_sum = 0.0;
+    for (k, v) in &payments_input {
+        let amt = v.as_f64().unwrap_or(0.0);
+        if amt > 0.0 {
+            payment_breakdown.insert(k.clone(), json!((amt * 100.0).round() / 100.0));
+            payments_sum += amt;
+        }
+    }
+    if payment_breakdown.is_empty() {
+        let pm = { let p = clean_text(payload.get("paymentMethod")); if p.is_empty() { "Efectivo".to_string() } else { p } };
+        payment_breakdown.insert(pm, json!(total));
+        payments_sum = total;
+    } else if (payments_sum - total).abs() > 0.01 {
+        return Err(format!("El pago (${:.2}) no coincide con el total (${:.2})", payments_sum, total));
+    }
+    let payment_method = if payment_breakdown.len() > 1 {
+        "Mixto".to_string()
+    } else {
+        payment_breakdown.keys().next().cloned().unwrap_or_else(|| "Efectivo".to_string())
+    };
     for line in &items {
         let sku = clean_text(line.get("sku"));
         let product = products.iter().find(|p| clean_text(p.get("sku")) == sku).unwrap();
@@ -882,10 +1196,10 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
         create_item(conn, "moves", &mov_id, &mov)?;
     }
     let items_json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-    let payment_method = { let p = clean_text(payload.get("paymentMethod")); if p.is_empty() { "Efectivo".to_string() } else { p } };
     let sale = json!({
         "id": id, "timestamp": timestamp, "itemsJson": items_json, "subtotal": subtotal,
         "discount": discount, "total": total, "paymentMethod": payment_method,
+        "paymentBreakdown": Value::Object(payment_breakdown),
         "user": display_or_username(&user), "notes": "", "profit": profit
     });
     create_item(conn, "sales", &id, &sale)?;
@@ -931,6 +1245,8 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "count" => op_count(conn, sessions, token, payload),
         "checkout" => op_checkout(conn, sessions, token, payload),
         "sync_batch" => op_sync_batch(conn, sessions, token, payload),
+        "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
+        "cash_cut" => op_cash_cut(conn, sessions, token, payload),
         _ => Ok(json!({"ok": false, "error": "Operacion no reconocida"})),
     }
 }
@@ -970,6 +1286,159 @@ fn init_db(conn: &Connection) {
     .expect("no se pudo crear la tabla store_data");
 }
 
+// ---------- panel web (Supabase) - solo lectura por ahora ----------
+
+const SUPABASE_URL: &str = "https://qizccncdyhzxeltwzjni.supabase.co/rest/v1";
+const SUPABASE_KEY: &str = "sb_publishable_yrmAdp65Ai2IzEnTQkMVeA_zT_qeLSA";
+
+fn supabase_upsert(table: &str, rows: &[Value]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let url = format!("{}/{}", SUPABASE_URL, table);
+    let client = http_client();
+    let resp = client
+        .post(&url)
+        .header("apikey", SUPABASE_KEY)
+        .header("Content-Type", "application/json")
+        .header("Prefer", "resolution=merge-duplicates,return=minimal")
+        .json(&Value::Array(rows.to_vec()))
+        .send()
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        return Err(format!("Supabase respondio {}: {}", status, text));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sync_to_cloud(app: tauri::AppHandle, db: tauri::State<DbConn>) -> Value {
+    let conn = match db.0.lock() {
+        Ok(c) => c,
+        Err(_) => return json!({"ok": false, "error": "Error de base de datos local"}),
+    };
+    let license_key = get_or_create_license_key(&conn);
+    let settings = read_settings(&conn);
+    let business_name = clean_text(settings.get("storeTitle"));
+    let app_version = app.package_info().version.to_string();
+
+    let sync_state = get_item(&conn, "cloud_sync", "state").unwrap_or_else(|| json!({}));
+    let last_sales_ts = clean_text(sync_state.get("lastSalesTs"));
+    let last_cuts_ts = clean_text(sync_state.get("lastCutsTs"));
+
+    let products = list_items(&conn, "products");
+    let product_rows: Vec<Value> = products
+        .iter()
+        .map(|p| {
+            json!({
+                "license_key": license_key,
+                "sku": clean_text(p.get("sku")),
+                "name": clean_text(p.get("name")),
+                "category": clean_text(p.get("category")),
+                "presentation": clean_text(p.get("presentation")),
+                "supplier": clean_text(p.get("supplier")),
+                "unit": clean_text(p.get("unit")),
+                "cost": num_of(p.get("cost")),
+                "price": num_of(p.get("price")),
+                "stock": num_of(p.get("stock")),
+                "min_stock": num_of(p.get("minStock")),
+                "active": not_false(p.get("active")),
+                "updated_at": now_iso()
+            })
+        })
+        .collect();
+
+    let sales = list_items(&conn, "sales");
+    let new_sales: Vec<&Value> = sales
+        .iter()
+        .filter(|s| last_sales_ts.is_empty() || clean_text(s.get("timestamp")) > last_sales_ts)
+        .collect();
+    let mut max_sales_ts = last_sales_ts.clone();
+    let sale_rows: Vec<Value> = new_sales
+        .iter()
+        .map(|s| {
+            let ts = clean_text(s.get("timestamp"));
+            if ts > max_sales_ts {
+                max_sales_ts = ts.clone();
+            }
+            json!({
+                "license_key": license_key,
+                "id": clean_text(s.get("id")),
+                "ts": ts,
+                "total": num_of(s.get("total")),
+                "subtotal": num_of(s.get("subtotal")),
+                "payment_method": clean_text(s.get("paymentMethod")),
+                "payment_breakdown": s.get("paymentBreakdown").cloned().unwrap_or_else(|| json!({})),
+                "cashier": clean_text(s.get("user")),
+                "profit": num_of(s.get("profit"))
+            })
+        })
+        .collect();
+
+    let cuts = list_items(&conn, "cash_cuts");
+    let new_cuts: Vec<&Value> = cuts
+        .iter()
+        .filter(|c| clean_text(c.get("type")) != "apertura")
+        .filter(|c| last_cuts_ts.is_empty() || clean_text(c.get("timestamp")) > last_cuts_ts)
+        .collect();
+    let mut max_cuts_ts = last_cuts_ts.clone();
+    let cut_rows: Vec<Value> = new_cuts
+        .iter()
+        .map(|c| {
+            let ts = clean_text(c.get("timestamp"));
+            if ts > max_cuts_ts {
+                max_cuts_ts = ts.clone();
+            }
+            let period_start = clean_text(c.get("periodStart"));
+            json!({
+                "license_key": license_key,
+                "id": clean_text(c.get("id")),
+                "cut_type": clean_text(c.get("type")),
+                "ts": ts,
+                "period_start": if period_start.is_empty() { Value::Null } else { json!(period_start) },
+                "period_end": clean_text(c.get("periodEnd")),
+                "total": num_of(c.get("total")),
+                "opening_amount": num_of(c.get("openingAmount")),
+                "cashier": clean_text(c.get("user"))
+            })
+        })
+        .collect();
+
+    let meta_row = json!({
+        "license_key": license_key,
+        "business_name": business_name,
+        "app_version": app_version,
+        "last_sync": now_iso()
+    });
+
+    let mut errors: Vec<String> = vec![];
+    if let Err(e) = supabase_upsert("pos_meta", &[meta_row]) {
+        errors.push(e);
+    }
+    if let Err(e) = supabase_upsert("pos_products", &product_rows) {
+        errors.push(e);
+    }
+    if let Err(e) = supabase_upsert("pos_sales", &sale_rows) {
+        errors.push(e);
+    } else {
+        create_item(&conn, "cloud_sync", "state", &json!({"lastSalesTs": max_sales_ts, "lastCutsTs": last_cuts_ts})).ok();
+    }
+    if let Err(e) = supabase_upsert("pos_cash_cuts", &cut_rows) {
+        errors.push(e);
+    } else {
+        create_item(&conn, "cloud_sync", "state", &json!({"lastSalesTs": max_sales_ts, "lastCutsTs": max_cuts_ts})).ok();
+    }
+
+    if errors.is_empty() {
+        json!({"ok": true, "productsSynced": product_rows.len(), "salesSynced": sale_rows.len(), "cutsSynced": cut_rows.len()})
+    } else {
+        json!({"ok": false, "error": errors.join(" | ")})
+    }
+}
+
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -986,7 +1455,7 @@ fn main() {
             app.manage(SessionStore(Mutex::new(HashMap::new())));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![backend_call])
+        .invoke_handler(tauri::generate_handler![backend_call, check_license, check_for_update, download_and_launch_update, sync_to_cloud])
         .run(tauri::generate_context!())
         .expect("error al ejecutar la aplicacion Tauri");
 }
