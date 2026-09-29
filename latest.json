@@ -1,0 +1,11 @@
+{
+  "version": "0.2.6",
+  "notes": "La ventana de productos (por categoria o busqueda por nombre) ahora se cierra sola al elegir un articulo y el foco regresa automatico al campo de escaneo, corrigiendo que el lector de codigo de barras se quedara sin poder escribir. Se agrega el atajo F1 para ir directo a la pantalla de Venta desde cualquier pantalla, para cajero y administrador.",
+  "pub_date": "2026-09-26T01:02:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "",
+      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.6/Tienda.POS_0.2.6_x64-setup.exe"
+    }
+  }
+}

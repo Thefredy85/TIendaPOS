@@ -985,12 +985,6 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
         sku = candidate;
     }
     let exists = products.iter().any(|p| clean_text(p.get("sku")) == sku);
-    let barcode = clean_text(rec.get("barcode"));
-    if !barcode.is_empty() {
-        if let Some(dup) = products.iter().find(|p| clean_text(p.get("sku")) != sku && clean_text(p.get("barcode")) == barcode) {
-            return Err(format!("Ese código de barras ya está asignado a \"{}\" ({}). Cada producto necesita un código único para que el escaneo no descuente el producto equivocado.", clean_text(dup.get("name")), clean_text(dup.get("sku"))));
-        }
-    }
     let cost = num_of(rec.get("cost"));
     let price = num_of(rec.get("price"));
     let (cost_iva, cost_wo) = iva_parts(cost);
@@ -998,7 +992,7 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
     let stock = if let Some(e) = &existing { num_of(e.get("stock")) } else { num_of(rec.get("stock")) };
     let record = json!({
         "sku": sku,
-        "barcode": barcode,
+        "barcode": clean_text(rec.get("barcode")),
         "name": clean_text(rec.get("name")),
         "category": clean_text(rec.get("category")),
         "presentation": clean_text(rec.get("presentation")),
