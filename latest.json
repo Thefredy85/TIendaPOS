@@ -1,11 +1,11 @@
 {
-  "version": "0.2.6",
-  "notes": "La ventana de productos (por categoria o busqueda por nombre) ahora se cierra sola al elegir un articulo y el foco regresa automatico al campo de escaneo, corrigiendo que el lector de codigo de barras se quedara sin poder escribir. Se agrega el atajo F1 para ir directo a la pantalla de Venta desde cualquier pantalla, para cajero y administrador.",
-  "pub_date": "2026-09-26T01:02:00Z",
+  "version": "0.2.7",
+  "notes": "Nuevos atajos de teclado F2 (Configuracion) y F4 (Entradas / salidas), ambos piden PIN de administrador o encargado si quien tiene la sesion es cajero. Nueva funcion 'En espera': guarda hasta 20 tickets pendientes con hora y total para cobrarlos despues, y sobreviven si se cierra la aplicacion. Correccion importante: ahora no se puede guardar un producto con un codigo de barras que ya este usado por otro producto (antes esto podia causar que se descontara el producto equivocado al escanear), y se agrego un aviso en Productos si ya existen codigos duplicados en el catalogo.",
+  "pub_date": "2026-09-29T09:35:00Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.6/Tienda.POS_0.2.6_x64-setup.exe"
+      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.7/Tienda.POS_0.2.7_x64-setup.exe"
     }
   }
 }

@@ -424,6 +424,71 @@ fn assert_role(user: &Value, roles: &[&str]) -> Result<(), String> {
     if roles.contains(&role.as_str()) { Ok(()) } else { Err("No autorizado".into()) }
 }
 
+// ---------- permisos configurables por rol ----------
+// admin siempre tiene todo. La gestion de usuarios y el cobro (checkout) quedan
+// fijos por seguridad y no son configurables desde aqui.
+const PERM_KEYS: [&str; 6] = ["settings", "catalogs", "products", "movements", "counts", "cashcut"];
+const PERM_ROLES: [&str; 2] = ["encargado", "cajero"];
+
+fn default_role_permission(role: &str, key: &str) -> bool {
+    match (role, key) {
+        ("cajero", "cashcut") => true,
+        ("cajero", _) => false,
+        ("encargado", _) => true,
+        _ => false,
+    }
+}
+
+fn read_role_permissions(conn: &Connection) -> Value {
+    let stored = get_item(conn, "role_permissions", "current").unwrap_or_else(|| json!({}));
+    let mut out = serde_json::Map::new();
+    for role in PERM_ROLES {
+        let mut role_map = serde_json::Map::new();
+        for key in PERM_KEYS {
+            let stored_val = stored.get(role).and_then(|r| r.get(key)).and_then(|v| v.as_bool());
+            let val = stored_val.unwrap_or_else(|| default_role_permission(role, key));
+            role_map.insert(key.to_string(), json!(val));
+        }
+        out.insert(role.to_string(), Value::Object(role_map));
+    }
+    Value::Object(out)
+}
+
+fn has_permission(perms: &Value, role: &str, key: &str) -> bool {
+    perms.get(role).and_then(|r| r.get(key)).and_then(|v| v.as_bool())
+        .unwrap_or_else(|| default_role_permission(role, key))
+}
+
+fn assert_permission(conn: &Connection, user: &Value, key: &str) -> Result<(), String> {
+    let role = clean_text(user.get("role"));
+    if role == "admin" { return Ok(()); }
+    let perms = read_role_permissions(conn);
+    if has_permission(&perms, &role, key) {
+        Ok(())
+    } else {
+        Err("No autorizado. Pide a un administrador que active este permiso para tu rol en Configuracion > Permisos.".into())
+    }
+}
+
+fn op_save_role_permissions(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    assert_role(&user, &["admin"])?;
+    let input = payload.get("permissions").cloned().unwrap_or_else(|| json!({}));
+    let mut out = serde_json::Map::new();
+    for role in PERM_ROLES {
+        let mut role_map = serde_json::Map::new();
+        for key in PERM_KEYS {
+            let val = input.get(role).and_then(|r| r.get(key)).map(truthy)
+                .unwrap_or_else(|| default_role_permission(role, key));
+            role_map.insert(key.to_string(), json!(val));
+        }
+        out.insert(role.to_string(), Value::Object(role_map));
+    }
+    let record = Value::Object(out);
+    create_item(conn, "role_permissions", "current", &record)?;
+    Ok(json!({"ok": true, "permissions": record}))
+}
+
 fn verify_supervisor(conn: &Connection, input: &Value) -> Result<Value, String> {
     let code = first_nonempty(input, &["code", "loginCode", "pin"]);
     let username = { let u = clean_text(input.get("username")); if !u.is_empty() { u } else { code.clone() } };
@@ -515,12 +580,36 @@ fn download_and_launch_update(url: String) -> Result<(), String> {
         .connect_timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
-    let bytes = download_client
+    let response = download_client
         .get(&url)
         .send()
-        .map_err(|e| format!("No se pudo descargar la actualizacion: {}", e))?
+        .map_err(|e| format!("No se pudo descargar la actualizacion: {}", e))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "El servidor de actualizaciones respondio con un error ({}). No se descargo ni se instalo nada; intenta de nuevo mas tarde o avisa que revisen la publicacion de la nueva version.",
+            status.as_u16()
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if content_type.contains("text/html") || content_type.contains("application/json") {
+        return Err("La respuesta del servidor no es un instalador valido (parece una pagina de error). No se instalo nada.".into());
+    }
+    let bytes = response
         .bytes()
         .map_err(|e| format!("No se pudo leer la actualizacion descargada: {}", e))?;
+    const MIN_INSTALLER_BYTES: usize = 1_000_000; // un instalador real siempre pesa varios MB
+    if bytes.len() < MIN_INSTALLER_BYTES {
+        return Err(format!(
+            "El archivo descargado es demasiado pequeno para ser el instalador real ({} bytes). No se instalo nada por seguridad.",
+            bytes.len()
+        ));
+    }
     let filename = url.rsplit('/').next().unwrap_or("Actualizacion_TiendaPOS.exe");
     let mut path = std::env::temp_dir();
     path.push(filename);
@@ -741,9 +830,11 @@ fn op_data(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &s
     let role = clean_text(user.get("role"));
     let admin = role == "admin";
     let manager = admin || role == "encargado";
+    let perms = read_role_permissions(conn);
+    let sees_ops = manager || has_permission(&perms, &role, "movements") || has_permission(&perms, &role, "counts");
     let products = list_items(conn, "products");
-    let moves = if manager { list_items(conn, "moves") } else { vec![] };
-    let counts = if manager { list_items(conn, "counts") } else { vec![] };
+    let moves = if sees_ops { list_items(conn, "moves") } else { vec![] };
+    let counts = if sees_ops { list_items(conn, "counts") } else { vec![] };
     let sales = list_items(conn, "sales");
     let settings = read_settings(conn);
     let categories = list_items(conn, "categories");
@@ -757,13 +848,13 @@ fn op_data(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &s
         "ok": true, "user": public_user(&user), "products": products, "moves": moves,
         "counts": counts, "sales": sales, "users": users, "settings": settings,
         "categories": categories, "units": units, "suppliers": suppliers, "presentations": presentations,
-        "cashState": cash_state, "cashCuts": cash_cuts
+        "cashState": cash_state, "cashCuts": cash_cuts, "rolePermissions": perms
     }))
 }
 
 fn op_open_cash_register(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado", "cajero"])?;
+    assert_permission(conn, &user, "cashcut")?;
     let existing_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
     if existing_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err("La caja ya esta abierta. Genera un Corte Z antes de abrir un turno nuevo.".into());
@@ -784,10 +875,20 @@ fn op_open_cash_register(conn: &Connection, sessions: &mut HashMap<String, Sessi
 
 fn op_cash_cut(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado", "cajero"])?;
+    assert_permission(conn, &user, "cashcut")?;
     let cut_type = clean_text(payload.get("type"));
     if !["x", "z"].contains(&cut_type.as_str()) {
         return Err("Tipo de corte no reconocido".into());
+    }
+    if cut_type == "z" {
+        let pending_held = num_of(payload.get("pendingHeldTickets")) as i64;
+        let pending_cart = num_of(payload.get("pendingCartItems")) as i64;
+        if pending_held > 0 || pending_cart > 0 {
+            return Err(format!(
+                "No se puede cerrar el turno (Corte Z): hay {} ticket(s) en espera y/o un ticket actual con {} producto(s) sin cobrar. Cobra o cancela esos tickets primero.",
+                pending_held, pending_cart
+            ));
+        }
     }
     let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
     if !cash_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -799,7 +900,7 @@ fn op_cash_cut(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     let sales = list_items(conn, "sales");
     let period_sales: Vec<&Value> = sales
         .iter()
-        .filter(|s| period_start.is_empty() || clean_text(s.get("timestamp")) >= period_start)
+        .filter(|s| (period_start.is_empty() || clean_text(s.get("timestamp")) >= period_start) && !truthy_opt(s.get("cancelled")))
         .collect();
     let total: f64 = period_sales.iter().map(|s| num_of(s.get("total"))).sum();
     let mut by_payment: HashMap<String, f64> = HashMap::new();
@@ -894,7 +995,7 @@ fn op_delete_user(conn: &Connection, sessions: &mut HashMap<String, Session>, to
 
 fn op_save_settings(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "settings")?;
     let settings = normalize_settings(payload);
     let record = json!({"key": "app", "value": settings.to_string()});
     create_item(conn, "settings", "app", &record)?;
@@ -913,7 +1014,7 @@ fn catalog_store(kind: &str) -> Option<&'static str> {
 
 fn op_save_catalog(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "catalogs")?;
     let kind = clean_text(payload.get("kind"));
     let store = catalog_store(&kind).ok_or_else(|| "Catalogo no reconocido".to_string())?;
     let name = clean_text(payload.get("name"));
@@ -945,7 +1046,7 @@ fn op_save_catalog(conn: &Connection, sessions: &mut HashMap<String, Session>, t
 
 fn op_delete_catalog(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "catalogs")?;
     let kind = clean_text(payload.get("kind"));
     let id = clean_text(payload.get("id"));
     let store = catalog_store(&kind);
@@ -959,7 +1060,7 @@ fn op_delete_catalog(conn: &Connection, sessions: &mut HashMap<String, Session>,
 
 fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "products")?;
     let rec = payload.get("record").cloned().unwrap_or_else(|| payload.clone());
     let products = list_items(conn, "products");
     let editing_sku = { let a = clean_text(payload.get("editingSku")); if !a.is_empty() { a } else { clean_text(rec.get("editingSku")) } };
@@ -1028,7 +1129,7 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
 
 fn op_delete_product(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "products")?;
     let sku = clean_text(payload.get("sku"));
     if sku.is_empty() { return Err("Falta SKU".into()); }
     let products = list_items(conn, "products");
@@ -1041,7 +1142,7 @@ fn op_delete_product(conn: &Connection, sessions: &mut HashMap<String, Session>,
 
 fn op_movement(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "movements")?;
     let products = list_items(conn, "products");
     let sku = clean_text(payload.get("sku"));
     let product = products.iter().find(|p| clean_text(p.get("sku")) == sku).cloned()
@@ -1068,7 +1169,7 @@ fn op_movement(conn: &Connection, sessions: &mut HashMap<String, Session>, token
 
 fn op_delete_movement(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "movements")?;
     let mut admin_user = user.clone();
     if let Some(admin_input) = payload.get("admin") {
         if !clean_text(admin_input.get("username")).is_empty() {
@@ -1106,7 +1207,7 @@ fn op_delete_movement(conn: &Connection, sessions: &mut HashMap<String, Session>
 
 fn op_count(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
-    assert_role(&user, &["admin", "encargado"])?;
+    assert_permission(conn, &user, "counts")?;
     let products = list_items(conn, "products");
     let sku = clean_text(payload.get("sku"));
     let product = products.iter().find(|p| clean_text(p.get("sku")) == sku).cloned()
@@ -1229,6 +1330,67 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     Ok(json!({"ok": true, "sale": sale}))
 }
 
+fn op_cancel_sale(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    let mut admin_user = user.clone();
+    if assert_role(&user, &["admin", "encargado"]).is_err() {
+        let admin_input = payload.get("admin")
+            .ok_or_else(|| "No autorizado".to_string())?;
+        if clean_text(admin_input.get("username")).is_empty() {
+            return Err("No autorizado".into());
+        }
+        admin_user = verify_supervisor(conn, admin_input)?;
+    }
+    let id = clean_text(payload.get("id"));
+    if id.is_empty() { return Err("Falta la venta a cancelar".into()); }
+    let sales = list_items(conn, "sales");
+    let sale = sales.iter().find(|s| clean_text(s.get("id")) == id).cloned()
+        .ok_or_else(|| "Venta no encontrada".to_string())?;
+    if truthy_opt(sale.get("cancelled")) {
+        return Err("Esta venta ya habia sido cancelada".into());
+    }
+    let items: Vec<Value> = serde_json::from_str(&clean_text(sale.get("itemsJson"))).unwrap_or_default();
+    if items.is_empty() {
+        return Err("Esta venta no tiene productos que revertir".into());
+    }
+    let products = list_items(conn, "products");
+    let mut restored: Vec<Value> = vec![];
+    let mut skipped: Vec<String> = vec![];
+    let timestamp = now_iso();
+    for line in &items {
+        let sku = clean_text(line.get("sku"));
+        let qty = num_of(line.get("qty"));
+        if let Some(product) = products.iter().find(|p| clean_text(p.get("sku")) == sku) {
+            let before = num_of(product.get("stock"));
+            let after = before + qty;
+            patch_item(conn, "products", &sku, &json!({"stock": after}))?;
+            let mov_id = format!("MOV-DEV-{}-{}", now_millis(), sku);
+            let cost = num_of(product.get("cost"));
+            let mov = json!({
+                "id": mov_id, "timestamp": timestamp, "type": "devolucion_venta", "sku": sku,
+                "productName": clean_text(line.get("name")),
+                "quantity": qty, "stockBefore": before, "stockAfter": after,
+                "unitCost": cost, "totalCost": cost * qty,
+                "reason": format!("Cancelacion de venta {}", id), "reference": id,
+                "user": display_or_username(&user), "authorizedBy": display_or_username(&admin_user), "notes": ""
+            });
+            create_item(conn, "moves", &mov_id, &mov)?;
+            restored.push(json!({"sku": sku, "qty": qty}));
+        } else {
+            // el producto ya no existe en el catalogo (fue eliminado despues de la venta):
+            // no hay a donde devolver la existencia, se deja constancia y se continua.
+            skipped.push(sku);
+        }
+    }
+    patch_item(conn, "sales", &id, &json!({
+        "cancelled": true,
+        "cancelledAt": timestamp,
+        "cancelledBy": display_or_username(&user),
+        "cancelledAuthorizedBy": display_or_username(&admin_user)
+    }))?;
+    Ok(json!({"ok": true, "restored": restored, "skippedSkus": skipped}))
+}
+
 fn op_sync_batch(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
     assert_role(&user, &["admin", "encargado", "cajero"])?;
@@ -1259,6 +1421,7 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "save_user" => op_save_user(conn, sessions, token, payload),
         "delete_user" => op_delete_user(conn, sessions, token, payload),
         "save_settings" => op_save_settings(conn, sessions, token, payload),
+        "save_role_permissions" => op_save_role_permissions(conn, sessions, token, payload),
         "save_catalog" => op_save_catalog(conn, sessions, token, payload),
         "delete_catalog" => op_delete_catalog(conn, sessions, token, payload),
         "save_product" => op_save_product(conn, sessions, token, payload),
@@ -1267,6 +1430,7 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "delete_movement" => op_delete_movement(conn, sessions, token, payload),
         "count" => op_count(conn, sessions, token, payload),
         "checkout" => op_checkout(conn, sessions, token, payload),
+        "cancel_sale" => op_cancel_sale(conn, sessions, token, payload),
         "sync_batch" => op_sync_batch(conn, sessions, token, payload),
         "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
         "cash_cut" => op_cash_cut(conn, sessions, token, payload),
