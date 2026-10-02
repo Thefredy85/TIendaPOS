@@ -610,9 +610,20 @@ fn download_and_launch_update(url: String) -> Result<(), String> {
             bytes.len()
         ));
     }
-    let filename = url.rsplit('/').next().unwrap_or("Actualizacion_TiendaPOS.exe");
+    // Un .exe de Windows valido siempre inicia con la firma "MZ". Si el archivo
+    // descargado no la tiene, es basura (una pagina, una redireccion mal resuelta,
+    // una descarga truncada, etc.) y jamas debe ejecutarse.
+    if bytes.len() < 2 || &bytes[0..2] != b"MZ" {
+        return Err(
+            "El archivo descargado no tiene el formato de un instalador de Windows valido. No se instalo nada por seguridad; intenta de nuevo mas tarde o avisa que revisen la publicacion de la nueva version.".into(),
+        );
+    }
+    // El nombre local NUNCA se toma de la URL: un espacio, acento o caracter mal
+    // codificado en el nombre del archivo remoto (p. ej. "%20") puede guardar el
+    // instalador con un nombre corrupto que Windows no reconoce como ejecutable
+    // valido. Usamos siempre un nombre fijo y seguro.
     let mut path = std::env::temp_dir();
-    path.push(filename);
+    path.push("TiendaPOS_Actualizacion.exe");
     std::fs::write(&path, &bytes).map_err(|e| format!("No se pudo guardar el instalador: {}", e))?;
     std::process::Command::new(&path)
         .spawn()
