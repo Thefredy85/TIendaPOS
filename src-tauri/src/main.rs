@@ -308,6 +308,14 @@ fn normalize_settings(source: &Value) -> Value {
         "cashCutShowProducts": not_false(g("cashCutShowProducts")),
         "cashCutShowPayments": not_false(g("cashCutShowPayments")),
         "cashCutGroupBy": ({ let v = clean_text(g("cashCutGroupBy")); if ["normal","categoria","proveedor"].contains(&v.as_str()) { v } else { "normal".to_string() } }),
+        "ticketPaperWidth": ({ let v = clean_text(g("ticketPaperWidth")); if v == "58" { v } else { "80".to_string() } }),
+        "ticketCompactMode": truthy_opt(g("ticketCompactMode")),
+        "ticketLineSpacing": ({ let v = clean_text(g("ticketLineSpacing")); if ["tight","normal","wide"].contains(&v.as_str()) { v } else { "normal".to_string() } }),
+        "cashCutLineSpacing": ({ let v = clean_text(g("cashCutLineSpacing")); if ["tight","normal","wide"].contains(&v.as_str()) { v } else { "normal".to_string() } }),
+        "cashCutShowName": not_false(g("cashCutShowName")),
+        "cashCutShowBarcode": not_false(g("cashCutShowBarcode")),
+        "cashCutShowUnit": truthy_opt(g("cashCutShowUnit")),
+        "cashCutShowSupplier": truthy_opt(g("cashCutShowSupplier")),
         "enabledPaymentMethods": ({
             let epm = g("enabledPaymentMethods");
             let get_flag = |key: &str| -> bool {
@@ -1078,26 +1086,28 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
     let existing = if !editing_sku.is_empty() {
         products.iter().find(|p| clean_text(p.get("sku")) == editing_sku).cloned()
     } else { None };
-    let mut sku = clean_text(rec.get("sku"));
-    if sku.is_empty() {
-        if let Some(e) = &existing { sku = clean_text(e.get("sku")); }
+    // El identificador interno (campo "sku") ya no lo escribe nadie: es automatico,
+    // nunca se muestra y nunca se reutiliza. Un producto existente conserva el suyo
+    // para no romper ventas, movimientos ni conteos historicos.
+    if !editing_sku.is_empty() && existing.is_none() {
+        return Err("Producto no encontrado. Recarga la pantalla e intenta de nuevo.".into());
     }
-    if sku.is_empty() {
-        let cat_source = { let c = clean_text(rec.get("category")); if c.is_empty() { "producto".to_string() } else { c } };
-        let mut cat_slug = slug(&cat_source).replace('_', "").to_uppercase();
-        if cat_slug.len() > 4 { cat_slug.truncate(4); }
-        if cat_slug.is_empty() { cat_slug = "PROD".to_string(); }
-        let count = products.iter().filter(|p| clean_text(p.get("category")) == clean_text(rec.get("category"))).count() + 1;
-        let mut candidate = format!("{}-{:04}", cat_slug, count);
-        let mut next = count;
-        while products.iter().any(|p| clean_text(p.get("sku")) == candidate) {
-            next += 1;
-            candidate = format!("{}-{:04}", cat_slug, next);
+    let sku = if let Some(e) = &existing {
+        clean_text(e.get("sku"))
+    } else {
+        let mut candidate;
+        loop {
+            candidate = format!("P{}{}", now_millis(), random_suffix());
+            if !products.iter().any(|p| clean_text(p.get("sku")) == candidate) { break; }
         }
-        sku = candidate;
-    }
+        candidate
+    };
     let exists = products.iter().any(|p| clean_text(p.get("sku")) == sku);
     let barcode = clean_text(rec.get("barcode"));
+    let barcode_required = match &existing { None => true, Some(e) => !clean_text(e.get("barcode")).is_empty() };
+    if barcode.is_empty() && barcode_required {
+        return Err("El codigo de barras es obligatorio. Escanealo o escribelo para guardar el producto.".into());
+    }
     if !barcode.is_empty() {
         if let Some(dup) = products.iter().find(|p| clean_text(p.get("sku")) != sku && clean_text(p.get("barcode")) == barcode) {
             return Err(format!("Ese código de barras ya está asignado a \"{}\" ({}). Cada producto necesita un código único para que el escaneo no descuente el producto equivocado.", clean_text(dup.get("name")), clean_text(dup.get("sku"))));

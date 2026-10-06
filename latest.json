@@ -1,11 +1,11 @@
 {
-  "version": "0.2.8",
-  "notes": "Permisos configurables por rol (encargado/cajero) en Configuracion > Permisos. Cancelacion/devolucion de venta con reverso automatico de inventario. El Corte Z ya no se puede generar si hay tickets en espera o un ticket sin cobrar. Los tickets en espera parpadean si llevan mas de 90 minutos. Correccion del actualizador para que valide que la descarga sea valida antes de instalar. Confirmacion obligatoria al vaciar el ticket. Tecla Esc regresa al menu de Configuracion. Atajos F2 (Configuracion) y F4 (Entradas/salidas).",
-  "pub_date": "2026-09-30T14:50:00Z",
+  "version": "0.2.9",
+  "notes": "Alerta de codigos duplicados (SKU/codigo de barras) al iniciar sesion, con acceso directo a editar el producto sin tocar inventario ni ventas. Ticket optimizado para ahorrar papel: ancho configurable 58mm/80mm y modo compacto. Correccion del actualizador: ya no guarda el instalador con un nombre corrupto y valida que el archivo descargado sea un .exe valido antes de instalarlo.",
+  "pub_date": "2026-10-02T23:10:00Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.8/Tienda.POS_0.2.8_x64-setup.exe"
+      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.9/Tienda.POS_0.2.9_x64-setup.exe"
     }
   }
 }
