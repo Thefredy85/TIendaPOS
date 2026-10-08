@@ -4,12 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version a publicar, por ejemplo v0.2.11"
+        required: true
 
 jobs:
   publicar:
     permissions:
       contents: write
     runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.version || github.ref_name }}
     steps:
       - name: Descargar codigo
         uses: actions/checkout@v4
@@ -22,6 +29,26 @@ jobs:
       - name: Preparar Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Revisar que el numero de version coincida
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $expected = $env:TAG.TrimStart('v')
+          if ($conf.package.version -ne $expected) {
+            throw "La version en tauri.conf.json ($($conf.package.version)) no coincide con $env:TAG. Sube tauri.conf.json con la version correcta."
+          }
+
+      - name: Pruebas de la logica (ventas, inventario, productos, ajustes)
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Pruebas de pantalla (tocar, escanear y cobrar)
+        env:
+          PW_CHANNEL: chrome
+        run: |
+          npm install --no-save playwright
+          node tests/ui-smoke.mjs
+
       - name: Instalar Tauri CLI
         run: npm install -g @tauri-apps/cli@1
 
@@ -30,8 +57,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Version ${{ github.ref_name }}"
+          tagName: ${{ env.TAG }}
+          releaseName: "Version ${{ env.TAG }}"
           releaseBody: "Actualizacion publicada automaticamente desde GitHub Actions."
           releaseDraft: false
           prerelease: false
@@ -42,11 +69,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:TAG
           $version = $tag.TrimStart('v')
-          $installer = Get-ChildItem -Recurse -Path "src-tauri/target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
-          if (-not $installer) { throw "No se encontro el instalador .exe generado por tauri-action" }
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($installer.Name))"
+          # Se usa el nombre REAL con el que GitHub guardo el instalador (cambia espacios por puntos)
+          $assets = gh release view $tag --repo "${{ github.repository }}" --json assets | ConvertFrom-Json
+          $asset = $assets.assets | Where-Object { $_.name -like "*-setup.exe" } | Select-Object -First 1
+          if (-not $asset) { throw "No se encontro el instalador en la publicacion $tag" }
+          $url = $asset.url
+          Write-Host "Instalador: $url"
           $manifest = [ordered]@{
             version   = $version
             notes     = "Actualizacion $version publicada automaticamente desde GitHub Actions."
