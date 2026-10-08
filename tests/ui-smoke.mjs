@@ -1,6 +1,3 @@
-FILExt
-desde 2000
-
 // Prueba de pantalla de Tienda POS.
 //
 // Abre el src/index.html REAL en Chromium, conectado a la logica REAL del programa
@@ -13,6 +10,7 @@ desde 2000
 //             CARGO_OFFLINE=1, TEST_BRIDGE_PORT=8765
 
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -22,7 +20,10 @@ let playwright;
 try { playwright = require('playwright'); } catch { playwright = require('playwright-core'); }
 const { chromium } = playwright;
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// La raiz del proyecto es la carpeta que contiene src-tauri (funciona aunque este archivo
+// quede en la raiz o dentro de la carpeta tests).
+let root = path.dirname(fileURLToPath(import.meta.url));
+for (let i = 0; i < 4 && !existsSync(path.join(root, 'src-tauri')); i++) root = path.resolve(root, '..');
 const indexUrl = pathToFileURL(path.join(root, 'src', 'index.html')).href;
 const PORT = process.env.TEST_BRIDGE_PORT || '8765';
 const BRIDGE = `http://127.0.0.1:${PORT}/call`;
