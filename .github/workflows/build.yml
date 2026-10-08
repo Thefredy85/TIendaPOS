@@ -43,11 +43,15 @@ jobs:
         run: cargo test
 
       - name: Pruebas de pantalla (tocar, escanear y cobrar)
+        shell: pwsh
         env:
           PW_CHANNEL: chrome
         run: |
           npm install --no-save playwright
-          node tests/ui-smoke.mjs
+          $f = Get-ChildItem -Recurse -File -Filter "ui-smoke.mjs" | Where-Object { $_.FullName -notmatch "node_modules" } | Select-Object -First 1
+          if (-not $f) { throw "Falta el archivo ui-smoke.mjs en el repositorio. Subelo (en la carpeta tests o en la raiz) y vuelve a publicar." }
+          Write-Host "Usando $($f.FullName)"
+          node $f.FullName
 
       - name: Instalar Tauri CLI
         run: npm install -g @tauri-apps/cli@1
