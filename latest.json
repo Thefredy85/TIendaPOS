@@ -1,11 +1,11 @@
 {
-  "version": "0.2.9",
-  "notes": "Alerta de codigos duplicados (SKU/codigo de barras) al iniciar sesion, con acceso directo a editar el producto sin tocar inventario ni ventas. Ticket optimizado para ahorrar papel: ancho configurable 58mm/80mm y modo compacto. Correccion del actualizador: ya no guarda el instalador con un nombre corrupto y valida que el archivo descargado sea un .exe valido antes de instalarlo.",
-  "pub_date": "2026-10-02T23:10:00Z",
+  "version": "0.2.10",
+  "notes": "Se quita el SKU: todo se identifica por codigo de barras, con un identificador interno automatico que no se repite ni sobrescribe productos. La alerta de duplicados revisa solo codigo de barras. Corte X y Z con opciones de diseno: espaciado, codigo de barras, unidad, nombre y proveedor. Correccion: las opciones de papel 58mm y modo compacto ahora se conservan al guardar la personalizacion.",
+  "pub_date": "2026-10-06T02:30:00Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.9/Tienda.POS_0.2.9_x64-setup.exe"
+      "url": "https://github.com/Thefredy85/TiendaPOS/releases/download/v0.2.10/Tienda.POS_0.2.10_x64-setup.exe"
     }
   }
 }

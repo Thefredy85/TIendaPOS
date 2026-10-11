@@ -1693,3 +1693,162 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error al ejecutar la aplicacion Tauri");
 }
+
+// ---------- pruebas automaticas (no se incluyen en el programa final) ----------
+// Se ejecutan con `cargo test` antes de publicar cada version. El flujo de GitHub
+// Actions las corre y NO publica nada si alguna falla.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn fresh() -> (Connection, HashMap<String, Session>, String) {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        let mut sessions = HashMap::new();
+        dispatch("setup_admin", &json!({"loginCode":"1234","password":"1234","displayName":"Admin"}), "", &conn, &mut sessions).unwrap();
+        let r = dispatch("login", &json!({"code":"1234"}), "", &conn, &mut sessions).unwrap();
+        let token = r["sessionToken"].as_str().unwrap().to_string();
+        (conn, sessions, token)
+    }
+    fn put(conn: &Connection, sku: &str, barcode: &str, name: &str, price: f64, stock: f64) {
+        create_item(conn, "products", sku, &json!({"sku":sku,"barcode":barcode,"name":name,"category":"Bebidas","presentation":"Pieza","unit":"pieza","stock":stock,"minStock":1,"price":price,"cost":price/2.0,"active":true})).unwrap();
+    }
+    fn count(conn: &Connection) -> usize { list_items(conn, "products").len() }
+    fn stock_of(conn: &Connection, sku: &str) -> f64 { num_of(get_item(conn, "products", sku).unwrap().get("stock")) }
+
+    #[test]
+    fn productos_nuevos_no_sobrescriben_a_los_existentes() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "", "Granel", 9.0, 7.0);
+        // el SKU que mande el cliente se ignora: jamas debe pisar a un producto existente
+        let r = dispatch("save_product", &json!({"record":{"sku":"BEB-0001","barcode":"222","name":"Nuevo","category":"Bebidas","price":20,"cost":10,"stock":3}}), &t, &conn, &mut s).unwrap();
+        assert_ne!(r["product"]["sku"].as_str().unwrap(), "BEB-0001");
+        assert_eq!(count(&conn), 3);
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["name"], "Agua");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        // codigo de barras obligatorio y unico
+        assert!(dispatch("save_product", &json!({"record":{"name":"X","category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s).is_err());
+        assert!(dispatch("save_product", &json!({"record":{"barcode":"111","name":"Y","category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s).is_err());
+        assert_eq!(count(&conn), 3);
+        // editar conserva identificador y existencia
+        dispatch("save_product", &json!({"editingSku":"BEB-0001","record":{"barcode":"111","name":"Agua 600","category":"Bebidas","price":13,"cost":5,"stock":999}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["name"], "Agua 600");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        // un producto viejo sin codigo (a granel) se puede seguir editando
+        dispatch("save_product", &json!({"editingSku":"BEB-0002","record":{"barcode":"","name":"Granel","category":"Bebidas","price":9,"cost":4,"active":false}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0002"), 7.0);
+        assert!(dispatch("save_product", &json!({"editingSku":"NOPE","record":{"barcode":"999","name":"Z","category":"Bebidas"}}), &t, &conn, &mut s).is_err());
+        assert_eq!(count(&conn), 3);
+        // 50 productos nuevos seguidos: ids distintos
+        let mut ids = std::collections::HashSet::new();
+        for i in 0..50 {
+            let r = dispatch("save_product", &json!({"record":{"barcode":format!("B{}",i),"name":format!("P{}",i),"category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s).unwrap();
+            ids.insert(r["product"]["sku"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), 50);
+        assert_eq!(count(&conn), 53);
+    }
+
+    #[test]
+    fn la_personalizacion_conserva_todas_sus_opciones() {
+        let n = normalize_settings(&json!({"ticketPaperWidth":"58","ticketCompactMode":true,"ticketLineSpacing":"tight","cashCutLineSpacing":"wide","cashCutShowUnit":true,"cashCutShowSupplier":true,"cashCutShowBarcode":false}));
+        assert_eq!(n["ticketPaperWidth"], "58");
+        assert_eq!(n["ticketCompactMode"], true);
+        assert_eq!(n["ticketLineSpacing"], "tight");
+        assert_eq!(n["cashCutLineSpacing"], "wide");
+        assert_eq!(n["cashCutShowUnit"], true);
+        assert_eq!(n["cashCutShowSupplier"], true);
+        assert_eq!(n["cashCutShowBarcode"], false);
+        let d = normalize_settings(&json!({}));
+        assert_eq!(d["ticketPaperWidth"], "80");
+        assert_eq!(d["cashCutShowName"], true);
+    }
+
+    #[test]
+    fn venta_completa_descuenta_inventario_y_valida_el_total() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.5, 10.0);
+        put(&conn, "P1759000000000ABC", "222", "Refresco", 18.0, 5.0);
+        // sin caja abierta no se puede vender
+        let items = json!([{"sku":"BEB-0001","qty":2},{"sku":"P1759000000000ABC","qty":1}]);
+        assert!(dispatch("checkout", &json!({"items":items,"payments":{"Efectivo":43.0}}), &t, &conn, &mut s).is_err());
+        dispatch("open_cash_register", &json!({"openingAmount":100}), &t, &conn, &mut s).unwrap();
+        // pago que no coincide: rechazado y sin tocar inventario
+        let bad = dispatch("checkout", &json!({"clientId":"S1","items":items,"payments":{"Efectivo":44.0}}), &t, &conn, &mut s);
+        assert!(bad.is_err() && bad.unwrap_err().contains("no coincide con el total"));
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        assert_eq!(stock_of(&conn, "P1759000000000ABC"), 5.0);
+        // pago correcto: descuenta una sola vez y registra movimientos
+        dispatch("checkout", &json!({"clientId":"S2","items":items,"payments":{"Efectivo":43.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+        assert_eq!(stock_of(&conn, "P1759000000000ABC"), 4.0);
+        // reintento con el mismo folio no vuelve a descontar
+        dispatch("checkout", &json!({"clientId":"S2","items":items,"payments":{"Efectivo":43.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+        // cancelar la venta devuelve el inventario
+        dispatch("cancel_sale", &json!({"id":"S2"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        assert_eq!(stock_of(&conn, "P1759000000000ABC"), 5.0);
+    }
+
+    // Servidor local que permite a la prueba de pantalla (tests/ui-smoke.mjs) usar la
+    // logica REAL del programa. Solo se arranca a mano: `cargo test ui_bridge -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ui_bridge() {
+        let port = std::env::var("TEST_BRIDGE_PORT").unwrap_or_else(|_| "8765".into());
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+        let (mut conn, mut sessions, _t) = fresh();
+        for stream in listener.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (header_end, content_len) = loop {
+                let n = match stream.read(&mut chunk) { Ok(n) => n, Err(_) => 0 };
+                if n == 0 { break (0, 0); }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                    let cl = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    break (pos + 4, cl);
+                }
+            };
+            if header_end == 0 { continue; }
+            while buf.len() < header_end + content_len {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(json!({}));
+            let op = body["op"].as_str().unwrap_or("").to_string();
+            let token = body["sessionToken"].as_str().unwrap_or("").to_string();
+            let payload = body.get("payload").cloned().unwrap_or(json!({}));
+            let out: Value = match op.as_str() {
+                "__test_reset" => {
+                    let (c, s, _) = fresh();
+                    conn = c; sessions = s;
+                    json!({"ok": true})
+                }
+                "__test_put_product" => {
+                    let sku = clean_text(payload.get("sku"));
+                    create_item(&conn, "products", &sku, &payload).unwrap();
+                    json!({"ok": true})
+                }
+                "__test_get_product" => {
+                    let sku = clean_text(payload.get("sku"));
+                    get_item(&conn, "products", &sku).unwrap_or(json!(null))
+                }
+                _ => match dispatch(&op, &payload, &token, &conn, &mut sessions) {
+                    Ok(v) => v,
+                    Err(msg) => json!({"ok": false, "error": msg}),
+                },
+            };
+            let text = out.to_string();
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", text.len(), text);
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    }
+}
