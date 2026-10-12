@@ -2,3 +2,11 @@ node_modules/
 src-tauri/target/
 *.log
 .DS_Store
+
+# Llaves y contraseñas (nunca al repo)
+.env
+.env.*
+!.env.example
+
+# Archivos locales del CLI de Supabase
+supabase/.temp/
