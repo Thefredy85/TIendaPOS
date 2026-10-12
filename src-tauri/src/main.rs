@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 const IVA_RATE: f64 = 0.16;
@@ -224,14 +224,29 @@ fn get_item(conn: &Connection, store: &str, id: &str) -> Option<Value> {
     raw.ok().and_then(|s| serde_json::from_str(&s).ok())
 }
 
+// Ejecuta varias escrituras como una sola: o quedan todas o ninguna.
+// (SAVEPOINT se puede anidar, asi que funciona aunque ya haya una transaccion abierta.)
+fn in_savepoint<F: FnOnce() -> Result<(), String>>(conn: &Connection, f: F) -> Result<(), String> {
+    conn.execute_batch("SAVEPOINT escritura").map_err(|e| e.to_string())?;
+    match f() {
+        Ok(()) => conn.execute_batch("RELEASE escritura").map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO escritura; RELEASE escritura");
+            Err(e)
+        }
+    }
+}
+
 fn create_item(conn: &Connection, store: &str, id: &str, record: &Value) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO store_data (store, id, data) VALUES (?1, ?2, ?3)
-         ON CONFLICT(store, id) DO UPDATE SET data = excluded.data",
-        params![store, id, record.to_string()],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    in_savepoint(conn, || {
+        conn.execute(
+            "INSERT INTO store_data (store, id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(store, id) DO UPDATE SET data = excluded.data",
+            params![store, id, record.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        outbox_enqueue(conn, store, id, None)
+    })
 }
 
 fn patch_item(conn: &Connection, store: &str, id: &str, patch: &Value) -> Result<(), String> {
@@ -245,9 +260,60 @@ fn patch_item(conn: &Connection, store: &str, id: &str, patch: &Value) -> Result
 }
 
 fn delete_item(conn: &Connection, store: &str, id: &str) -> Result<(), String> {
+    // lo ultimo que se supo del registro viaja a la nube marcado como borrado
+    let last = get_item(conn, store, id);
+    in_savepoint(conn, || {
+        conn.execute(
+            "DELETE FROM store_data WHERE store = ?1 AND id = ?2",
+            params![store, id],
+        )
+        .map_err(|e| e.to_string())?;
+        outbox_enqueue(conn, store, id, last.as_ref())
+    })
+}
+
+// ---------- cola de envio a la nube (outbox) ----------
+// Cada escritura de los datos que se espejean anota (store, id) aqui, en la misma
+// operacion. Al enviar se lee el estado ACTUAL del registro, asi que diez cambios
+// sin internet se envian una sola vez. `version` sube con cada cambio: un registro
+// solo sale de la cola si no cambio mientras se enviaba.
+
+const SYNC_STORES: [&str; 6] = ["products", "sales", "moves", "cash_cuts", "users", "role_permissions"];
+
+fn outbox_enqueue(conn: &Connection, store: &str, id: &str, tombstone: Option<&Value>) -> Result<(), String> {
+    if !SYNC_STORES.contains(&store) {
+        return Ok(());
+    }
     conn.execute(
-        "DELETE FROM store_data WHERE store = ?1 AND id = ?2",
-        params![store, id],
+        "INSERT INTO outbox (store, id, version, tombstone) VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(store, id) DO UPDATE SET version = version + 1, tombstone = excluded.tombstone",
+        params![store, id, tombstone.map(|t| t.to_string())],
+    )
+    .map_err(|e| e.to_string())?;
+    wake_cloud_worker(false);
+    Ok(())
+}
+
+fn outbox_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).unwrap_or(0)
+}
+
+// Carga inicial: encola todo lo que hay. Solo LEE los datos; no cambia ninguno.
+fn outbox_enqueue_all(conn: &Connection) -> Result<(), String> {
+    let stores = SYNC_STORES.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(",");
+    conn.execute(
+        &format!(
+            "INSERT INTO outbox (store, id, version) SELECT store, id, 1 FROM store_data
+             WHERE store IN ({}) ON CONFLICT(store, id) DO NOTHING",
+            stores
+        ),
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    // los permisos van aunque nunca se hayan guardado (asi el panel ve los de fabrica)
+    conn.execute(
+        "INSERT INTO outbox (store, id, version) VALUES ('role_permissions', 'current', 1) ON CONFLICT(store, id) DO NOTHING",
+        [],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1492,186 +1558,453 @@ fn init_db(conn: &Connection) {
         [],
     )
     .expect("no se pudo crear la tabla store_data");
+    // v0.2.12: cola de envio a la nube. Solo se agrega; no toca los datos existentes.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS outbox (
+            store TEXT NOT NULL,
+            id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            tombstone TEXT,
+            PRIMARY KEY (store, id)
+        )",
+        [],
+    )
+    .expect("no se pudo crear la tabla outbox");
 }
 
-// ---------- panel web (Supabase) - solo lectura por ahora ----------
+// ---------- nube (Supabase): registro de la caja, envio y latido ----------
+//
+// La caja se registra una vez con su license_key y recibe un token secreto propio
+// (la license_key sola no basta: se puede adivinar). Un hilo en segundo plano envia
+// la cola (outbox) con la RPC pos_push y manda un latido cada minuto. La base local
+// NUNCA queda bloqueada mientras se usa la red: se toma el candado solo para leer o
+// para marcar lo enviado. Si no hay internet, todo se queda en la cola local.
 
 const SUPABASE_URL: &str = "https://qizccncdyhzxeltwzjni.supabase.co/rest/v1";
 const SUPABASE_KEY: &str = "sb_publishable_yrmAdp65Ai2IzEnTQkMVeA_zT_qeLSA";
+const PUSH_BATCH: usize = 300;
+const HEARTBEAT_SECS: i64 = 60;
+const DEFAULT_STORE_TITLE: &str = "Tienda de Conveniencia";
 
-fn supabase_upsert(table: &str, rows: &[Value]) -> Result<(), String> {
-    if rows.is_empty() {
-        return Ok(());
+// Para despertar al hilo de envio en cuanto hay algo nuevo en la cola.
+// (bool = hay trabajo, bool = forzar latido)
+static CLOUD_WAKE: OnceLock<(Mutex<(bool, bool)>, Condvar)> = OnceLock::new();
+// Un solo envio a la vez.
+static CLOUD_STEP: Mutex<()> = Mutex::new(());
+
+fn cloud_wake() -> &'static (Mutex<(bool, bool)>, Condvar) {
+    CLOUD_WAKE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()))
+}
+
+fn wake_cloud_worker(force_heartbeat: bool) {
+    let (m, c) = cloud_wake();
+    if let Ok(mut f) = m.lock() {
+        f.0 = true;
+        f.1 = f.1 || force_heartbeat;
     }
-    let url = format!("{}/{}", SUPABASE_URL, table);
-    let client = http_client();
+    c.notify_all();
+}
+
+// Espera hasta `timeout` o hasta que alguien despierte al hilo. Devuelve si hay que forzar el latido.
+fn wait_cloud_worker(timeout: Duration) -> bool {
+    let (m, c) = cloud_wake();
+    let guard = match m.lock() { Ok(g) => g, Err(_) => return false };
+    let (mut guard, _) = match c.wait_timeout_while(guard, timeout, |f| !f.0) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let force = guard.1;
+    *guard = (false, false);
+    force
+}
+
+fn cloud_state(conn: &Connection) -> Value {
+    get_item(conn, "cloud", "device").unwrap_or_else(|| json!({}))
+}
+
+fn save_cloud_state(conn: &Connection, patch: &Value) {
+    patch_item(conn, "cloud", "device", patch).ok();
+}
+
+fn assigned_store_title(conn: &Connection) -> String {
+    let t = clean_text(read_settings(conn).get("storeTitle"));
+    if t == DEFAULT_STORE_TITLE { String::new() } else { t }
+}
+
+// Nombre de la caja en la nube: el nombre de la tienda cuando ya se asigno;
+// mientras tanto, el nombre de Windows del equipo.
+fn cloud_device_name(store_title: &str) -> String {
+    if !store_title.is_empty() {
+        return store_title.chars().take(80).collect();
+    }
+    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+    if host.trim().is_empty() { "Caja".to_string() } else { host.trim().to_string() }
+}
+
+fn rpc_call(name: &str, args: &Value) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
     let resp = client
-        .post(&url)
+        .post(format!("{}/rpc/{}", SUPABASE_URL, name))
         .header("apikey", SUPABASE_KEY)
         .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates,return=minimal")
-        .json(&Value::Array(rows.to_vec()))
+        .json(args)
         .send()
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        return Err(format!("Supabase respondio {}: {}", status, text));
+        .map_err(|_| "Sin conexion con la nube".to_string())?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        let msg = serde_json::from_str::<Value>(&text)
+            .ok()
+            .map(|v| clean_text(v.get("message")))
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| format!("La nube respondio {}", status));
+        return Err(msg);
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+// ----- conversion de registros locales al formato de la nube -----
+// Solo se copian los campos listados. Contrasenas, hashes, salt y pin NUNCA salen.
+
+fn opt_text(v: Option<&Value>) -> Value {
+    let t = clean_text(v);
+    if t.is_empty() { Value::Null } else { json!(t) }
+}
+
+fn cloud_product(p: &Value) -> Value {
+    json!({
+        "internal_id": clean_text(p.get("sku")),
+        "barcode": opt_text(p.get("barcode")),
+        "name": opt_text(p.get("name")),
+        "category": opt_text(p.get("category")),
+        "presentation": opt_text(p.get("presentation")),
+        "supplier": opt_text(p.get("supplier")),
+        "unit": opt_text(p.get("unit")),
+        "cost": num_of(p.get("cost")),
+        "price": num_of(p.get("price")),
+        "stock": num_of(p.get("stock")),
+        "min_stock": num_of(p.get("minStock")),
+        "description": opt_text(p.get("description")),
+        "active": not_false(p.get("active"))
+    })
+}
+
+fn cloud_user(u: &Value) -> Value {
+    json!({
+        "username": clean_text(u.get("username")),
+        "display_name": opt_text(u.get("displayName")),
+        "role": opt_text(u.get("role")),
+        "active": not_false(u.get("active"))
+    })
+}
+
+fn cloud_movement(m: &Value) -> Value {
+    json!({
+        "id": clean_text(m.get("id")),
+        "ts": opt_text(m.get("timestamp")),
+        "type": opt_text(m.get("type")),
+        "internal_id": opt_text(m.get("sku")),
+        "product_name": opt_text(m.get("productName")),
+        "quantity": m.get("quantity").cloned().unwrap_or(Value::Null),
+        "stock_before": m.get("stockBefore").cloned().unwrap_or(Value::Null),
+        "stock_after": m.get("stockAfter").cloned().unwrap_or(Value::Null),
+        "unit_cost": m.get("unitCost").cloned().unwrap_or(Value::Null),
+        "total_cost": m.get("totalCost").cloned().unwrap_or(Value::Null),
+        "reason": opt_text(m.get("reason")),
+        "reference": opt_text(m.get("reference")),
+        "user_name": opt_text(m.get("user")),
+        "authorized_by": opt_text(m.get("authorizedBy")),
+        "notes": opt_text(m.get("notes"))
+    })
+}
+
+fn cloud_cut(c: &Value) -> Value {
+    json!({
+        "id": clean_text(c.get("id")),
+        "type": opt_text(c.get("type")),
+        "ts": opt_text(c.get("timestamp")),
+        "period_start": opt_text(c.get("periodStart")),
+        "period_end": opt_text(c.get("periodEnd")),
+        "opening_amount": num_of(c.get("openingAmount")),
+        "total": num_of(c.get("total")),
+        "sales_count": num_of(c.get("salesCount")),
+        "payments": c.get("payments").cloned().unwrap_or_else(|| json!({})),
+        "cashier": opt_text(c.get("user")),
+        "notes": opt_text(c.get("notes")),
+        "detail": c.clone()
+    })
+}
+
+fn cloud_sale(conn: &Connection, s: &Value) -> Value {
+    let lines: Vec<Value> = serde_json::from_str(&clean_text(s.get("itemsJson"))).unwrap_or_default();
+    let items: Vec<Value> = lines
+        .iter()
+        .map(|l| {
+            let sku = clean_text(l.get("sku"));
+            // las ventas viejas pueden no traer codigo o costo en la linea: se completa con el producto
+            let needs_product = clean_text(l.get("barcode")).is_empty() || l.get("cost").is_none() || l.get("name").is_none();
+            let product = if needs_product { get_item(conn, "products", &sku) } else { None };
+            let from = |k: &str| l.get(k).filter(|v| !clean_text(Some(v)).is_empty()).or_else(|| product.as_ref().and_then(|p| p.get(k)));
+            json!({
+                "internal_id": sku,
+                "barcode": opt_text(from("barcode")),
+                "name": opt_text(from("name")),
+                "qty": num_of(l.get("qty")),
+                "price": from("price").cloned().unwrap_or(Value::Null),
+                "cost": from("cost").cloned().unwrap_or(Value::Null)
+            })
+        })
+        .collect();
+    json!({
+        "id": clean_text(s.get("id")),
+        "ts": opt_text(s.get("timestamp")),
+        "subtotal": num_of(s.get("subtotal")),
+        "discount": num_of(s.get("discount")),
+        "total": num_of(s.get("total")),
+        "payment_method": opt_text(s.get("paymentMethod")),
+        "payment_breakdown": s.get("paymentBreakdown").cloned().unwrap_or_else(|| json!({})),
+        "cashier": opt_text(s.get("user")),
+        "profit": num_of(s.get("profit")),
+        "notes": opt_text(s.get("notes")),
+        "cancelled": truthy_opt(s.get("cancelled")),
+        "cancelled_at": opt_text(s.get("cancelledAt")),
+        "cancelled_by": opt_text(s.get("cancelledBy")),
+        "cancelled_authorized_by": opt_text(s.get("cancelledAuthorizedBy")),
+        "items": items
+    })
+}
+
+// Arma un envio con lo que hay en la cola. Devuelve el lote y las claves (store, id, version)
+// para marcarlas como enviadas solo si Supabase confirma.
+fn build_push_batch(conn: &Connection, limit: usize) -> (Value, Vec<(String, String, i64)>) {
+    let mut keys: Vec<(String, String, i64, Option<String>)> = vec![];
+    if let Ok(mut stmt) = conn.prepare("SELECT store, id, version, tombstone FROM outbox ORDER BY rowid LIMIT ?1") {
+        if let Ok(rows) = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))) {
+            keys = rows.filter_map(|r| r.ok()).collect();
+        }
+    }
+    let mut batch = json!({
+        "at": now_iso(), "products": [], "sales": [], "movements": [], "cash_cuts": [], "users": []
+    });
+    let push = |batch: &mut Value, kind: &str, row: Value| {
+        if let Some(a) = batch.get_mut(kind).and_then(|v| v.as_array_mut()) { a.push(row); }
+    };
+    for (store, id, _, tombstone) in &keys {
+        let current = get_item(conn, store, id);
+        let (record, deleted) = match (&current, tombstone) {
+            (Some(r), _) => (r.clone(), false),
+            (None, Some(t)) => (serde_json::from_str::<Value>(t).unwrap_or_else(|_| json!({})), true),
+            (None, None) => (json!({}), true),
+        };
+        let mark = |mut v: Value| { if deleted { v["deleted"] = json!(true); } v };
+        match store.as_str() {
+            "products" => { let mut v = cloud_product(&record); v["internal_id"] = json!(id); push(&mut batch, "products", mark(v)); }
+            "users" => { let mut v = cloud_user(&record); v["username"] = json!(id); push(&mut batch, "users", mark(v)); }
+            "moves" => { let mut v = cloud_movement(&record); v["id"] = json!(id); push(&mut batch, "movements", mark(v)); }
+            // ventas y cortes nunca se borran en la caja
+            "sales" if !deleted => push(&mut batch, "sales", cloud_sale(conn, &record)),
+            "cash_cuts" if !deleted => push(&mut batch, "cash_cuts", cloud_cut(&record)),
+            // permisos efectivos: los guardados o, si nunca se cambiaron, los de fabrica
+            "role_permissions" => { batch["role_permissions"] = read_role_permissions(conn); }
+            _ => {}
+        }
+    }
+    (batch, keys.into_iter().map(|(s, i, v, _)| (s, i, v)).collect())
+}
+
+fn ack_push_batch(conn: &Connection, keys: &[(String, String, i64)]) {
+    for (store, id, version) in keys {
+        conn.execute(
+            "DELETE FROM outbox WHERE store = ?1 AND id = ?2 AND version = ?3",
+            params![store, id, version],
+        )
+        .ok();
+    }
+}
+
+fn active_session_user(app: &tauri::AppHandle) -> String {
+    let now = now_millis();
+    app.state::<SessionStore>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|s| {
+            s.values()
+                .filter(|x| x.expires_at > now)
+                .max_by_key(|x| x.expires_at)
+                .map(|x| x.username.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn with_db<T>(app: &tauri::AppHandle, f: impl FnOnce(&Connection) -> T) -> Option<T> {
+    let db = app.state::<DbConn>();
+    let conn = db.0.lock().ok()?;
+    Some(f(&conn))
+}
+
+// Un ciclo completo: registrar si hace falta, latido si toca y vaciar la cola.
+// Devuelve Ok si se pudo hablar con la nube.
+fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), String> {
+    let _one_at_a_time = CLOUD_STEP.lock().map_err(|_| "ocupado".to_string())?;
+    let app_version = app.package_info().version.to_string();
+    let (state, license_key, store_title) = with_db(app, |conn| {
+        (cloud_state(conn), get_or_create_license_key(conn), assigned_store_title(conn))
+    })
+    .ok_or("Error de base de datos local")?;
+
+    // 1. registro (una sola vez)
+    let mut token = clean_text(state.get("token"));
+    let mut status = clean_text(state.get("status"));
+    if token.is_empty() {
+        let r = rpc_call("pos_register_device", &json!({
+            "p_license_key": license_key,
+            "p_device_name": cloud_device_name(&store_title),
+            "p_app_version": app_version,
+            "p_business_name": if store_title.is_empty() { Value::Null } else { json!(store_title) }
+        }));
+        match r {
+            Ok(v) => {
+                token = clean_text(v.get("token"));
+                status = clean_text(v.get("status"));
+                with_db(app, |conn| save_cloud_state(conn, &json!({
+                    "deviceId": clean_text(v.get("device_id")), "token": token, "status": status,
+                    "registeredAt": now_iso(), "lastError": ""
+                })));
+            }
+            Err(e) => {
+                with_db(app, |conn| save_cloud_state(conn, &json!({"lastError": e})));
+                return Err(e);
+            }
+        }
+    }
+    if status == "revocado" {
+        return Ok(());
+    }
+
+    // 2. latido
+    let last_hb = state.get("lastHeartbeatMs").and_then(|v| v.as_i64()).unwrap_or(0);
+    if force_heartbeat || now_millis() - last_hb >= HEARTBEAT_SECS * 1000 || status != "aprobado" {
+        let cash = with_db(app, |conn| get_item(conn, "cash_state", "current")).flatten().unwrap_or_else(|| json!({}));
+        let r = rpc_call("pos_heartbeat", &json!({
+            "p_token": token,
+            "p_info": {
+                "app_version": app_version,
+                "device_name": cloud_device_name(&store_title),
+                "business_name": if store_title.is_empty() { Value::Null } else { json!(store_title) },
+                "session_user": active_session_user(app),
+                "cash_open": truthy_opt(cash.get("isOpen")),
+                "cash_period_start": opt_text(cash.get("periodStart")),
+                "cash_opening_amount": num_of(cash.get("openingAmount"))
+            }
+        }));
+        match r {
+            Ok(v) => {
+                status = clean_text(v.get("status"));
+                with_db(app, |conn| save_cloud_state(conn, &json!({
+                    "status": status, "lastHeartbeatMs": now_millis(), "lastError": ""
+                })));
+            }
+            Err(e) => {
+                if e.contains("no registrada o revocada") {
+                    status = "revocado".to_string();
+                }
+                with_db(app, |conn| save_cloud_state(conn, &json!({"status": status, "lastError": e})));
+                return Err(e);
+            }
+        }
+    }
+    if status != "aprobado" {
+        return Ok(());
+    }
+
+    // 3. carga inicial (una vez, al quedar aprobada): encola todo lo local
+    if !truthy_opt(state.get("initialLoadDone")) {
+        with_db(app, |conn| {
+            if outbox_enqueue_all(conn).is_ok() {
+                save_cloud_state(conn, &json!({"initialLoadDone": true, "initialLoadAt": now_iso()}));
+            }
+        });
+    }
+
+    // 4. vaciar la cola por lotes
+    for _ in 0..200 {
+        let (batch, keys) = with_db(app, |conn| build_push_batch(conn, PUSH_BATCH)).ok_or("Error de base de datos local")?;
+        if keys.is_empty() {
+            break;
+        }
+        match rpc_call("pos_push", &json!({"p_token": token, "p_batch": batch})) {
+            Ok(_) => {
+                with_db(app, |conn| {
+                    ack_push_batch(conn, &keys);
+                    save_cloud_state(conn, &json!({"lastPushOkAt": now_iso(), "lastError": ""}));
+                });
+            }
+            Err(e) => {
+                with_db(app, |conn| save_cloud_state(conn, &json!({"lastError": e})));
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
 
-#[tauri::command]
-fn sync_to_cloud(app: tauri::AppHandle, db: tauri::State<DbConn>) -> Value {
-    // Todo lo que necesita la base de datos local se lee aqui adentro, en un
-    // bloque separado: al terminar el bloque el candado (MutexGuard) se suelta
-    // solo. Asi las llamadas de red que siguen (que pueden tardar varios
-    // segundos si el internet esta lento) NO bloquean el resto de la app
-    // (por ejemplo, que alguien pueda cobrar una venta al mismo tiempo).
-    let (
-        license_key,
-        business_name,
-        app_version,
-        last_sales_ts,
-        last_cuts_ts,
-        products,
-        sales,
-        cuts,
-    ) = {
-        let conn = match db.0.lock() {
-            Ok(c) => c,
-            Err(_) => return json!({"ok": false, "error": "Error de base de datos local"}),
-        };
-        let license_key = get_or_create_license_key(&conn);
-        let settings = read_settings(&conn);
-        let business_name = clean_text(settings.get("storeTitle"));
-        let app_version = app.package_info().version.to_string();
-        let sync_state = get_item(&conn, "cloud_sync", "state").unwrap_or_else(|| json!({}));
-        let last_sales_ts = clean_text(sync_state.get("lastSalesTs"));
-        let last_cuts_ts = clean_text(sync_state.get("lastCutsTs"));
-        let products = list_items(&conn, "products");
-        let sales = list_items(&conn, "sales");
-        let cuts = list_items(&conn, "cash_cuts");
-        (license_key, business_name, app_version, last_sales_ts, last_cuts_ts, products, sales, cuts)
-        // <- aqui se suelta el candado, antes de tocar la red
-    };
-    let product_rows: Vec<Value> = products
-        .iter()
-        .map(|p| {
-            json!({
-                "license_key": license_key,
-                "sku": clean_text(p.get("sku")),
-                "name": clean_text(p.get("name")),
-                "category": clean_text(p.get("category")),
-                "presentation": clean_text(p.get("presentation")),
-                "supplier": clean_text(p.get("supplier")),
-                "unit": clean_text(p.get("unit")),
-                "cost": num_of(p.get("cost")),
-                "price": num_of(p.get("price")),
-                "stock": num_of(p.get("stock")),
-                "min_stock": num_of(p.get("minStock")),
-                "active": not_false(p.get("active")),
-                "updated_at": now_iso()
-            })
-        })
-        .collect();
-
-    let new_sales: Vec<&Value> = sales
-        .iter()
-        .filter(|s| last_sales_ts.is_empty() || clean_text(s.get("timestamp")) > last_sales_ts)
-        .collect();
-    let mut max_sales_ts = last_sales_ts.clone();
-    let sale_rows: Vec<Value> = new_sales
-        .iter()
-        .map(|s| {
-            let ts = clean_text(s.get("timestamp"));
-            if ts > max_sales_ts {
-                max_sales_ts = ts.clone();
-            }
-            json!({
-                "license_key": license_key,
-                "id": clean_text(s.get("id")),
-                "ts": ts,
-                "total": num_of(s.get("total")),
-                "subtotal": num_of(s.get("subtotal")),
-                "payment_method": clean_text(s.get("paymentMethod")),
-                "payment_breakdown": s.get("paymentBreakdown").cloned().unwrap_or_else(|| json!({})),
-                "cashier": clean_text(s.get("user")),
-                "profit": num_of(s.get("profit"))
-            })
-        })
-        .collect();
-
-    let new_cuts: Vec<&Value> = cuts
-        .iter()
-        .filter(|c| clean_text(c.get("type")) != "apertura")
-        .filter(|c| last_cuts_ts.is_empty() || clean_text(c.get("timestamp")) > last_cuts_ts)
-        .collect();
-    let mut max_cuts_ts = last_cuts_ts.clone();
-    let cut_rows: Vec<Value> = new_cuts
-        .iter()
-        .map(|c| {
-            let ts = clean_text(c.get("timestamp"));
-            if ts > max_cuts_ts {
-                max_cuts_ts = ts.clone();
-            }
-            let period_start = clean_text(c.get("periodStart"));
-            json!({
-                "license_key": license_key,
-                "id": clean_text(c.get("id")),
-                "cut_type": clean_text(c.get("type")),
-                "ts": ts,
-                "period_start": if period_start.is_empty() { Value::Null } else { json!(period_start) },
-                "period_end": clean_text(c.get("periodEnd")),
-                "total": num_of(c.get("total")),
-                "opening_amount": num_of(c.get("openingAmount")),
-                "cashier": clean_text(c.get("user"))
-            })
-        })
-        .collect();
-
-    let meta_row = json!({
-        "license_key": license_key,
-        "business_name": business_name,
-        "app_version": app_version,
-        "last_sync": now_iso()
-    });
-
-    let mut errors: Vec<String> = vec![];
-    if let Err(e) = supabase_upsert("pos_meta", &[meta_row]) {
-        errors.push(e);
-    }
-    if let Err(e) = supabase_upsert("pos_products", &product_rows) {
-        errors.push(e);
-    }
-    let sales_ok = match supabase_upsert("pos_sales", &sale_rows) {
-        Ok(_) => true,
-        Err(e) => { errors.push(e); false }
-    };
-    let cuts_ok = match supabase_upsert("pos_cash_cuts", &cut_rows) {
-        Ok(_) => true,
-        Err(e) => { errors.push(e); false }
-    };
-    // Cada marca de avance (lastSalesTs / lastCutsTs) solo se mueve si ESA subida
-    // en particular tuvo exito; si una de las dos falla, no se debe perder el
-    // progreso de la otra ni marcar como sincronizado lo que en realidad fallo.
-    if sales_ok || cuts_ok {
-        let final_sales_ts = if sales_ok { max_sales_ts.clone() } else { last_sales_ts.clone() };
-        let final_cuts_ts = if cuts_ok { max_cuts_ts.clone() } else { last_cuts_ts.clone() };
-        // Se vuelve a tomar el candado solo un instante, ya con la red resuelta,
-        // nada mas para guardar hasta donde se avanzo.
-        if let Ok(conn) = db.0.lock() {
-            create_item(&conn, "cloud_sync", "state", &json!({"lastSalesTs": final_sales_ts, "lastCutsTs": final_cuts_ts})).ok();
+// Hilo en segundo plano: envia en cuanto hay cambios y manda el latido cada minuto.
+// Si falla, reintenta cada vez mas espaciado (5 s, 15 s, 1 min, hasta 5 min).
+fn cloud_worker(app: tauri::AppHandle) {
+    std::thread::sleep(Duration::from_secs(8));
+    let backoff = [5u64, 15, 60, 300];
+    let mut fails = 0usize;
+    let mut force = true;
+    loop {
+        match cloud_step(&app, force) {
+            Ok(()) => fails = 0,
+            Err(_) => fails = (fails + 1).min(backoff.len()),
         }
-    }
-
-    if errors.is_empty() {
-        json!({"ok": true, "productsSynced": product_rows.len(), "salesSynced": sale_rows.len(), "cutsSynced": cut_rows.len()})
-    } else {
-        json!({"ok": false, "error": errors.join(" | ")})
+        let wait = if fails == 0 { HEARTBEAT_SECS as u64 } else { backoff[fails - 1] };
+        force = wait_cloud_worker(Duration::from_secs(wait));
+        // pequena pausa para juntar en un solo envio los cambios de una misma venta
+        std::thread::sleep(Duration::from_millis(1500));
     }
 }
 
+fn cloud_status(conn: &Connection) -> Value {
+    let st = cloud_state(conn);
+    let status = clean_text(st.get("status"));
+    let pending = outbox_count(conn);
+    let last_error = clean_text(st.get("lastError"));
+    let message = match status.as_str() {
+        "aprobado" if pending == 0 => "Al dia".to_string(),
+        "aprobado" if last_error.is_empty() => format!("Enviando {} cambio(s)", pending),
+        "aprobado" => format!("Sin conexion: {} cambio(s) guardados para enviar", pending),
+        "pendiente" => format!("Caja pendiente de aprobacion ({} cambio(s) guardados para enviar)", pending),
+        "revocado" => "Esta caja fue dada de baja en la nube".to_string(),
+        _ => format!("Aun sin conectar a la nube ({} cambio(s) guardados para enviar)", pending),
+    };
+    json!({
+        "ok": status == "aprobado" && last_error.is_empty(),
+        "status": if status.is_empty() { "sin_registrar".to_string() } else { status },
+        "pending": pending,
+        "lastPushOkAt": clean_text(st.get("lastPushOkAt")),
+        "error": last_error,
+        "message": message
+    })
+}
+
+// Lo llama la pantalla (boton Actualizar y cada 20 min). No usa la red: despierta al
+// hilo de envio y responde al instante con el estado actual.
+#[tauri::command]
+fn sync_to_cloud(db: tauri::State<DbConn>) -> Value {
+    wake_cloud_worker(true);
+    match db.0.lock() {
+        Ok(conn) => cloud_status(&conn),
+        Err(_) => json!({"ok": false, "error": "Error de base de datos local"}),
+    }
+}
 
 fn main() {
     tauri::Builder::default()
@@ -1687,6 +2020,9 @@ fn main() {
             init_db(&conn);
             app.manage(DbConn(Mutex::new(conn)));
             app.manage(SessionStore(Mutex::new(HashMap::new())));
+            // envio a la nube en segundo plano (nunca bloquea la venta)
+            let cloud_handle = handle.clone();
+            std::thread::spawn(move || cloud_worker(cloud_handle));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![backend_call, check_license, check_for_update, download_and_launch_update, sync_to_cloud, exit_app])
@@ -1792,6 +2128,151 @@ mod tests {
         dispatch("cancel_sale", &json!({"id":"S2"}), &t, &conn, &mut s).unwrap();
         assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
         assert_eq!(stock_of(&conn, "P1759000000000ABC"), 5.0);
+    }
+
+    fn outbox_keys(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn.prepare("SELECT store, id FROM outbox ORDER BY store, id").unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+    fn snapshot(conn: &Connection) -> Vec<(String, String, String)> {
+        let mut stmt = conn.prepare("SELECT store, id, data FROM store_data ORDER BY store, id").unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+    fn clear_outbox(conn: &Connection) { conn.execute("DELETE FROM outbox", []).unwrap(); }
+
+    #[test]
+    fn la_cola_anota_cada_cambio_una_sola_vez() {
+        let (conn, mut s, t) = fresh();
+        clear_outbox(&conn);
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("open_cash_register", &json!({"openingAmount":100}), &t, &conn, &mut s).unwrap();
+        let items = json!([{"sku":"BEB-0001","barcode":"111","name":"Agua","qty":2,"price":12.0,"cost":6.0}]);
+        dispatch("checkout", &json!({"clientId":"S1","items":items,"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S2","items":items,"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        let keys = outbox_keys(&conn);
+        let n = |store: &str| keys.iter().filter(|(s, _)| s == store).count();
+        assert_eq!(n("products"), 1, "el producto cambio 3 veces pero se anota una vez");
+        assert_eq!(n("sales"), 2);
+        assert_eq!(n("moves"), 2);
+        assert_eq!(n("cash_cuts"), 1, "la apertura de caja");
+        // lo que no se espejea no entra a la cola
+        assert_eq!(n("cash_state"), 0);
+        assert_eq!(n("settings"), 0);
+    }
+
+    #[test]
+    fn lo_enviado_sale_de_la_cola_solo_si_no_cambio_mientras_se_enviaba() {
+        let (conn, mut s, t) = fresh();
+        clear_outbox(&conn);
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "222", "Jugo", 15.0, 4.0);
+        let (batch, keys) = build_push_batch(&conn, PUSH_BATCH);
+        assert_eq!(batch["products"].as_array().unwrap().len(), 2);
+        // mientras "viaja" el envio, se vende un jugo
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0002","qty":1,"price":15.0}],"payments":{"Efectivo":15.0}}), &t, &conn, &mut s).unwrap();
+        ack_push_batch(&conn, &keys);
+        let left = outbox_keys(&conn);
+        assert!(!left.contains(&("products".into(), "BEB-0001".into())), "el agua ya se envio");
+        assert!(left.contains(&("products".into(), "BEB-0002".into())), "el jugo cambio: debe reenviarse");
+        // y el reenvio lleva el stock nuevo
+        let (batch2, _) = build_push_batch(&conn, PUSH_BATCH);
+        let jugo = batch2["products"].as_array().unwrap().iter().find(|p| p["internal_id"] == "BEB-0002").unwrap();
+        assert_eq!(jugo["stock"], 3.0);
+    }
+
+    #[test]
+    fn el_envio_nunca_lleva_contrasenas_y_las_ventas_llevan_su_detalle() {
+        let (conn, mut s, t) = fresh();
+        let admin = get_item(&conn, "users", "1234").unwrap();
+        let hash = clean_text(admin.get("passwordHash"));
+        let salt = clean_text(admin.get("salt"));
+        assert!(!hash.is_empty() && !salt.is_empty());
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":2}],"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        dispatch("cancel_sale", &json!({"id":"S1"}), &t, &conn, &mut s).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        let text = batch.to_string();
+        assert!(!text.contains(&hash) && !text.contains(&salt));
+        assert!(!text.contains("passwordHash") && !text.contains("\"salt\"") && !text.contains("\"pin\""));
+        assert_eq!(batch["users"][0]["username"], "1234");
+        let sale = &batch["sales"][0];
+        assert_eq!(sale["cancelled"], true);
+        // la linea no traia codigo ni costo: se completan con el producto
+        assert_eq!(sale["items"][0]["barcode"], "111");
+        assert_eq!(sale["items"][0]["cost"], 6.0);
+        assert_eq!(sale["items"][0]["qty"], 2.0);
+        // sin permisos guardados viajan los de fabrica, completos
+        outbox_enqueue_all(&conn).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        assert_eq!(batch["role_permissions"]["cajero"]["cashcut"], true);
+        assert_eq!(batch["role_permissions"]["cajero"]["products"], false);
+        assert_eq!(batch["role_permissions"]["encargado"]["products"], true);
+    }
+
+    #[test]
+    fn borrar_viaja_como_borrado_con_sus_ultimos_datos() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        clear_outbox(&conn);
+        delete_item(&conn, "products", "BEB-0001").unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        let p = &batch["products"][0];
+        assert_eq!(p["deleted"], true);
+        assert_eq!(p["name"], "Agua");
+        assert_eq!(p["barcode"], "111");
+    }
+
+    #[test]
+    fn la_carga_inicial_no_cambia_productos_ni_stock() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "", "Granel", 9.0, 7.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).unwrap();
+        clear_outbox(&conn);
+        let before = snapshot(&conn);
+        outbox_enqueue_all(&conn).unwrap();
+        outbox_enqueue_all(&conn).unwrap();
+        assert_eq!(before, snapshot(&conn), "la carga inicial solo lee");
+        let has_perms = before.iter().any(|(st, _, _)| st == "role_permissions");
+        let expected = before.iter().filter(|(st, _, _)| SYNC_STORES.contains(&st.as_str())).count() + if has_perms { 0 } else { 1 };
+        assert_eq!(outbox_keys(&conn).len(), expected);
+        // y armar los envios tampoco cambia nada
+        let _ = build_push_batch(&conn, PUSH_BATCH);
+        assert_eq!(before, snapshot(&conn));
+    }
+
+    // Prueba REAL contra Supabase con un negocio de prueba. Solo a mano:
+    // `cargo test nube_de_punta_a_punta -- --ignored --nocapture`. Despues hay que borrar el negocio de prueba.
+    #[test]
+    #[ignore]
+    fn nube_de_punta_a_punta() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("open_cash_register", &json!({"openingAmount":50}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"SALE-E2E-1","items":[{"sku":"BEB-0001","qty":2}],"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).unwrap();
+        let key = format!("TP-PRUEBA-{}", now_millis());
+        let reg = rpc_call("pos_register_device", &json!({"p_license_key": key, "p_device_name": cloud_device_name(""), "p_app_version": "0.2.12-prueba", "p_business_name": "PRUEBA AUTOMATICA"})).unwrap();
+        println!("negocio de prueba: {}  registro: status={}", key, reg["status"]);
+        assert_eq!(reg["status"], "aprobado");
+        let token = reg["token"].as_str().unwrap().to_string();
+        let hb = rpc_call("pos_heartbeat", &json!({"p_token": token, "p_info": {"app_version":"0.2.12-prueba","device_name":"Tienda Prueba","cash_open":true}})).unwrap();
+        assert_eq!(hb["status"], "aprobado");
+        outbox_enqueue_all(&conn).unwrap();
+        let (batch, keys) = build_push_batch(&conn, PUSH_BATCH);
+        let r = rpc_call("pos_push", &json!({"p_token": token, "p_batch": batch})).unwrap();
+        println!("push: {}", r);
+        assert_eq!(r["applied"]["sales"], 1);
+        assert_eq!(r["applied"]["products"], 1);
+        assert_eq!(r["applied"]["cash_cuts"], 2);
+        ack_push_batch(&conn, &keys);
+        assert_eq!(outbox_count(&conn), 0);
+        assert!(rpc_call("pos_push", &json!({"p_token": "f".repeat(64), "p_batch": {}})).is_err());
     }
 
     // Servidor local que permite a la prueba de pantalla (tests/ui-smoke.mjs) usar la

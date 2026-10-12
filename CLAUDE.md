@@ -46,6 +46,7 @@ Proceso manual de respaldo (PowerShell, en la laptop):
 - v0.2.9: publicada. Corrigió el error del instalador ("16 bits", os error 216).
 - v0.2.10: publicada. Quitó el SKU, el Corte Z tiene las mismas opciones de diseño que el X y se guardan las opciones de papel 58mm y modo compacto. Bug: no deja cobrar porque el buscador comparaba solo contra el código de barras y la app mandaba el identificador interno.
 - v0.2.11: publicada el 2026-10-11 con GitHub Actions. Corrige ese bug (busca por código de barras y luego por identificador interno) y actualiza los precios del ticket si cambian.
+- v0.2.12: envío a la nube nueva (Fase 2). Tabla local `outbox` (solo agrega), registro de la caja con token, hilo de envío con reintentos, latido cada 60 s y carga inicial de solo lectura. Las cajas de negocios existentes quedan `pendiente` hasta aprobarlas.
 
 ## Supabase (espejo en la nube)
 - Proyecto `qizccncdyhzxeltwzjni` (tienda-pos-panel). La contraseña de la base va en `.env` (`SUPABASE_DB_PASSWORD`), nunca en el repo.
@@ -53,6 +54,8 @@ Proceso manual de respaldo (PowerShell, en la laptop):
 - Fase 1 (migración `20261012000100`): las tablas viejas pasan al esquema `legacy` (sin acceso, datos intactos); esquema nuevo con `business_id`/`device_id`; la app escribe solo por RPC (`pos_register_device`, `pos_heartbeat`, `pos_push`, `pos_pull_commands`, `pos_ack_command`).
 - La `license_key` NO es secreta: es `TP-` + 8 dígitos hex de la hora de instalación en nanosegundos (se puede adivinar). Cada caja se autentica con un token propio que da `pos_register_device`; en la nube solo se guarda su hash. En un negocio que ya existe, una caja nueva queda `pendiente` hasta que la apruebe el owner o el superadmin.
 - En la app, el campo local `sku` es en realidad el identificador interno. En la nube se llama `internal_id`.
+- Desde v0.2.12: toda escritura de productos, ventas, movimientos, cortes, usuarios y permisos pasa por `create_item`/`delete_item`, que la anotan en `outbox` en la misma operación. El hilo `cloud_worker` envía con `pos_push`; `sync_to_cloud` ya no usa la red (solo despierta al hilo y devuelve el estado).
+- Prueba real contra Supabase: `cargo test nube_de_punta_a_punta -- --ignored --nocapture` (crea un negocio `TP-PRUEBA-…` que luego hay que borrar).
 
 ## Otros pendientes (no son parte del panel web)
 - Pantalla de "movimientos de POS".

@@ -38,11 +38,13 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - [x] Compatibilidad: se eligió la opción 1. Las tablas viejas se cierran ya (pasan a `legacy`) y el espejo se pausa hasta la v0.2.12, que vuelve a subir todo desde lo local.
 
 ## Fase 2: app v0.2.12, envío en tiempo real (sin tocar productos ni inventario)
-- [ ] Tabla local `outbox` en SQLite. Cada venta, movimiento, corte X o Z y cambio de usuario se encola.
-- [ ] Envío inmediato cuando hay internet, con reintentos y backoff. La sincronización de 20 minutos queda como respaldo.
-- [ ] Latido cada 60 segundos a `pos_devices`.
-- [ ] Carga inicial: un envío completo de productos, usuarios y stock actual. Solo lectura local, sin modificar nada.
+- [x] Tabla local `outbox` en SQLite. Cada venta, movimiento, corte X o Z y cambio de usuario se encola.
+- [x] Envío inmediato cuando hay internet, con reintentos y backoff. La sincronización de 20 minutos queda como respaldo.
+- [x] Latido cada 60 segundos a `pos_devices`.
+- [x] Carga inicial: un envío completo de productos, usuarios y stock actual. Solo lectura local, sin modificar nada.
 - [ ] `cargo test` y publicar.
+- [x] Registro de cada caja con token propio; nombre = equipo de Windows y luego el nombre asignado de la tienda (migración `20261013000000`).
+- [ ] Aprobar las cajas de las 3 tiendas existentes (con confirmación del dueño).
 
 ## Fase 3: panel web de lectura (`web/`)
 - [ ] Login y selector de negocio.
