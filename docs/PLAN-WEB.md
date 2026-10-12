@@ -47,15 +47,17 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - [ ] Aprobar las cajas de las 3 tiendas existentes (con confirmación del dueño).
 
 ## Fase 3: panel web de lectura (`web/`)
-- [ ] Login y selector de negocio.
-- [ ] Inicio: ventas del día en vivo, total, ticket promedio y estado de la caja (en línea o última conexión, versión).
-- [ ] Ventas: lista con detalle, filtros por fecha y cajero, cancelaciones y devoluciones.
+- [x] Login y selector de negocio.
+- [x] Inicio: ventas del día en vivo, total, ticket promedio y estado de la caja (en línea o última conexión, versión).
+- [x] Ventas: lista con detalle, filtros por fecha y cajero, cancelaciones y devoluciones.
 - [ ] Inventario: stock actual y búsqueda por código de barras.
 - [ ] Movimientos: entradas, salidas, altas y bajas, con quién y cuándo.
-- [ ] Cortes X y Z: lista y vista con el formato del ticket.
+- [x] Cortes X y Z: lista y vista con el formato del ticket.
 - [ ] Usuarios y permisos (solo lectura).
 - [ ] Reportes: ventas por día, por producto y por cajero.
-- [ ] PWA instalable en la tablet y despliegue en Cloudflare Pages.
+- [x] PWA instalable en la tablet y despliegue en Cloudflare Pages (https://tienda-pos-panel.pages.dev).
+- [x] Cajas: aprobar, rechazar o dar de baja (owner o superadmin).
+- Primera entrega publicada el 2026-10-12 (diseño A, colores del POS). Siguen: inventario, movimientos, usuarios y reportes.
 
 ## Fase 4: edición desde la web (requiere actualizar la app)
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.

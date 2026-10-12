@@ -15,7 +15,7 @@ App de escritorio para Windows de punto de venta: ventas, inventario, cortes de 
 - `src/index.html`: interfaz completa del POS.
 - `src-tauri/`: backend en Rust y SQLite.
 - `supabase/migrations/`: esquema de Supabase como migraciones versionadas (la primera es la línea base de lo que ya existía).
-- `web/`: panel web de administración (nuevo, ver `docs/PLAN-WEB.md`).
+- `web/`: panel web de administración (ver `docs/PLAN-WEB.md`). Publicado en https://tienda-pos-panel.pages.dev con Cloudflare Pages: cada push a `main` lo actualiza solo (raíz `web`, `npm run build`, salida `dist`). En local: `npm --prefix web run dev`.
 
 ## Reglas de trabajo (obligatorias)
 1. Cuando el usuario diga "Trabajemos en una actualización", primero se define y confirma el alcance, y después se hace.
