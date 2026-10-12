@@ -46,7 +46,7 @@ Proceso manual de respaldo (PowerShell, en la laptop):
 - v0.2.9: publicada. Corrigió el error del instalador ("16 bits", os error 216).
 - v0.2.10: publicada. Quitó el SKU, el Corte Z tiene las mismas opciones de diseño que el X y se guardan las opciones de papel 58mm y modo compacto. Bug: no deja cobrar porque el buscador comparaba solo contra el código de barras y la app mandaba el identificador interno.
 - v0.2.11: publicada el 2026-10-11 con GitHub Actions. Corrige ese bug (busca por código de barras y luego por identificador interno) y actualiza los precios del ticket si cambian.
-- v0.2.12: envío a la nube nueva (Fase 2). Tabla local `outbox` (solo agrega), registro de la caja con token, hilo de envío con reintentos, latido cada 60 s y carga inicial de solo lectura. Las cajas de negocios existentes quedan `pendiente` hasta aprobarlas.
+- v0.2.12: **lista en `main` (commit cbf5ee8), pendiente de publicar** por decisión del dueño (necesita tiempo para la instalación). Para publicar: `git tag v0.2.12` y `git push origin v0.2.12`. Envío a la nube nueva (Fase 2). Tabla local `outbox` (solo agrega), registro de la caja con token, hilo de envío con reintentos, latido cada 60 s y carga inicial de solo lectura. Las cajas de negocios existentes quedan `pendiente` hasta aprobarlas.
 
 ## Supabase (espejo en la nube)
 - Proyecto `qizccncdyhzxeltwzjni` (tienda-pos-panel). La contraseña de la base va en `.env` (`SUPABASE_DB_PASSWORD`), nunca en el repo.
