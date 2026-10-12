@@ -1,0 +1,18 @@
+{
+  "name": "Tienda POS · Panel",
+  "short_name": "Tienda POS",
+  "description": "Ventas, cajas y cortes de tus tiendas en vivo",
+  "lang": "es-MX",
+  "start_url": "/#/inicio",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f2f4f1",
+  "theme_color": "#125f56",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
