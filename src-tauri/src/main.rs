@@ -54,6 +54,13 @@ fn random_text() -> String {
     format!("{:x}{:x}{:x}", nanos, c, std::process::id())
 }
 
+// Contador que nunca se repite mientras la app esta abierta. Se usa en los ids de
+// movimientos: con solo los milisegundos, dos movimientos del mismo producto en el
+// mismo milisegundo tenian el mismo id y el segundo borraba al primero del historial.
+fn next_seq() -> u64 {
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
 fn random_suffix() -> String {
     random_text().chars().rev().take(6).collect()
 }
@@ -1337,7 +1344,7 @@ fn op_count(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &
     create_item(conn, "counts", &id, &rec)?;
     patch_item(conn, "products", &sku, &json!({"stock": counted}))?;
     if diff != 0.0 {
-        let mov_id = format!("MOV-{}-{}", now_millis(), sku);
+        let mov_id = format!("MOV-{}-{}-{}", now_millis(), next_seq(), sku);
         let mov = json!({
             "id": mov_id, "timestamp": now_iso(), "type": "ajuste_conteo", "sku": sku,
             "productName": clean_text(product.get("name")),
@@ -1415,7 +1422,7 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
         let before = num_of(product.get("stock"));
         let after = before - qty;
         patch_item(conn, "products", &sku, &json!({"stock": after}))?;
-        let mov_id = format!("MOV-{}-{}", now_millis(), sku);
+        let mov_id = format!("MOV-{}-{}-{}", now_millis(), next_seq(), sku);
         let cost = num_of(product.get("cost"));
         let mov = json!({
             "id": mov_id, "timestamp": timestamp, "type": "venta", "sku": sku,
@@ -1471,7 +1478,7 @@ fn op_cancel_sale(conn: &Connection, sessions: &mut HashMap<String, Session>, to
             let before = num_of(product.get("stock"));
             let after = before + qty;
             patch_item(conn, "products", &sku, &json!({"stock": after}))?;
-            let mov_id = format!("MOV-DEV-{}-{}", now_millis(), sku);
+            let mov_id = format!("MOV-DEV-{}-{}-{}", now_millis(), next_seq(), sku);
             let cost = num_of(product.get("cost"));
             let mov = json!({
                 "id": mov_id, "timestamp": timestamp, "type": "devolucion_venta", "sku": sku,
@@ -2233,7 +2240,9 @@ mod tests {
         // despues del Z la caja queda cerrada y no se cobra
         assert!(dispatch("checkout", &json!({"clientId":"S5","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).is_err());
         assert!(dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).is_err());
-        // y se puede abrir un turno nuevo, que empieza en cero
+        // y se puede abrir un turno nuevo, que empieza en cero (en la tienda pasan
+        // segundos entre el Z y la apertura; aqui se espera un poco para no "empatar" el milisegundo)
+        std::thread::sleep(std::time::Duration::from_millis(5));
         dispatch("open_cash_register", &json!({"openingAmount":80}), &t, &conn, &mut s).unwrap();
         let x2 = dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).unwrap();
         assert_eq!(x2["cut"]["total"], 0.0);
