@@ -1,0 +1,37 @@
+name: Pruebas
+
+# Red de seguridad: en CADA push (a cualquier rama) se prueba la lógica y la pantalla
+# real, sin compilar el instalador ni publicar nada. Así un error en productos,
+# ventas o inventario se ve antes de crear la etiqueta vX que publica la versión.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pruebas:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Preparar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Pruebas de la logica (ventas, inventario, productos, ajustes)
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Pruebas de pantalla (vender, cobrar, dar de alta y editar productos)
+        shell: pwsh
+        env:
+          PW_CHANNEL: chrome
+        run: |
+          npm install --no-save playwright
+          node tests/ui-smoke.mjs

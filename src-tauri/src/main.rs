@@ -1082,7 +1082,12 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
     assert_permission(conn, &user, "products")?;
     let rec = payload.get("record").cloned().unwrap_or_else(|| payload.clone());
     let products = list_items(conn, "products");
-    let editing_sku = { let a = clean_text(payload.get("editingSku")); if !a.is_empty() { a } else { clean_text(rec.get("editingSku")) } };
+    // La pantalla indica si es un alta ("new") o una edicion ("edit"). En un alta se
+    // ignora cualquier editingSku que haya quedado: asi un producto nuevo NUNCA pisa a otro.
+    let mode = clean_text(payload.get("mode"));
+    let editing_sku = if mode == "new" { String::new() } else {
+        let a = clean_text(payload.get("editingSku")); if !a.is_empty() { a } else { clean_text(rec.get("editingSku")) }
+    };
     let existing = if !editing_sku.is_empty() {
         products.iter().find(|p| clean_text(p.get("sku")) == editing_sku).cloned()
     } else { None };
@@ -1111,6 +1116,21 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
     if !barcode.is_empty() {
         if let Some(dup) = products.iter().find(|p| clean_text(p.get("sku")) != sku && clean_text(p.get("barcode")) == barcode) {
             return Err(format!("Ese código de barras ya está asignado a \"{}\" ({}). Cada producto necesita un código único para que el escaneo no descuente el producto equivocado.", clean_text(dup.get("name")), clean_text(dup.get("sku"))));
+        }
+    }
+    // Cambiar a la vez el nombre y el codigo de barras de un producto existente casi
+    // siempre es un "producto nuevo" capturado por error sobre otro: se pide confirmar.
+    if let Some(e) = &existing {
+        let old_name = clean_text(e.get("name"));
+        let old_barcode = clean_text(e.get("barcode"));
+        let new_name = clean_text(rec.get("name"));
+        let renamed = !old_name.is_empty() && old_name.to_lowercase() != new_name.to_lowercase();
+        let recoded = !old_barcode.is_empty() && old_barcode != barcode;
+        if renamed && recoded && !truthy_opt(payload.get("confirmRename")) {
+            return Err(format!(
+                "CONFIRMAR: Vas a convertir \"{}\" (código {}) en \"{}\" (código {}). Conservará su existencia y su historial de ventas. Si querías dar de alta un producto nuevo, elige Cancelar y usa Cancelar edición.",
+                old_name, old_barcode, new_name, barcode
+            ));
         }
     }
     let cost = num_of(rec.get("cost"));
@@ -1750,6 +1770,32 @@ mod tests {
         }
         assert_eq!(ids.len(), 50);
         assert_eq!(count(&conn), 53);
+    }
+
+    #[test]
+    fn un_alta_nunca_pisa_a_un_producto_que_quedo_en_edicion() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        // la pantalla dejo "BEB-0001" en editingSku pero dice que es un alta: se crea uno nuevo
+        let r = dispatch("save_product", &json!({"mode":"new","editingSku":"BEB-0001","record":{"barcode":"750100","name":"Chocolate","category":"Botanas","price":14,"cost":8,"stock":6}}), &t, &conn, &mut s).unwrap();
+        assert_ne!(r["product"]["sku"], "BEB-0001");
+        assert_eq!(count(&conn), 2);
+        let agua = get_item(&conn, "products", "BEB-0001").unwrap();
+        assert_eq!(agua["name"], "Agua");
+        assert_eq!(agua["barcode"], "111");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        // una edicion que cambia nombre Y codigo a la vez pide confirmar y no toca nada
+        let e = dispatch("save_product", &json!({"mode":"edit","editingSku":"BEB-0001","record":{"barcode":"999","name":"Otra cosa","category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s);
+        assert!(e.unwrap_err().starts_with("CONFIRMAR:"));
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["name"], "Agua");
+        // las ediciones normales (solo precio, o solo nombre) pasan sin preguntar
+        dispatch("save_product", &json!({"mode":"edit","editingSku":"BEB-0001","record":{"barcode":"111","name":"Agua 1L","category":"Bebidas","price":13,"cost":6}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["name"], "Agua 1L");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        // y con confirmacion explicita, el cambio grande se permite
+        dispatch("save_product", &json!({"mode":"edit","editingSku":"BEB-0001","confirmRename":true,"record":{"barcode":"999","name":"Otra cosa","category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["barcode"], "999");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
     }
 
     #[test]
