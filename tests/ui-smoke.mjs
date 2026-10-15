@@ -214,6 +214,105 @@ async function main() {
     check((await page.locator('#productForm label', { hasText: /^SKU/ }).count()) === 0, 'el formulario de producto ya no pide SKU');
     check((await stock('DUP-0002')) === 4 && (await stock('DUP-0001')) === 3, 'abrir la alerta no cambia inventarios');
     await context.close();
+
+    // Falla real reportada en tiendas (v0.2.9 a v0.2.11): "agrego productos y no aparecen".
+    // Pulsar Editar y salir sin guardar hacia que el siguiente producto "nuevo" pisara al editado.
+    console.log('\n5) Dar de alta productos desde el formulario (sin tocar ventas ni inventario)');
+    await seed([product('DUP-0001', '999', 'Galleta A', 10, 3), product('DUP-0002', '999', 'Galleta B', 11, 4)]);
+    const boss = await call('login', { code: '1234' });
+    for (const name of ['Bebidas', 'Botanas', 'Abarrotes']) await call('save_catalog', { kind: 'category', name }, boss.sessionToken);
+    await call('open_cash_register', { openingAmount: 100 }, boss.sessionToken);
+    await call('checkout', { clientId: 'S-ANTES', items: [{ sku: 'BEB-0001', qty: 2 }], payments: { Efectivo: 25 } }, boss.sessionToken);
+    const snapshot = async () => {
+      const d = await call('data', {}, (await call('login', { code: '1234' })).sessionToken);
+      return { products: d.products || [], sales: JSON.stringify((d.sales || []).map((s) => [s.id, s.total, s.itemsJson])) };
+    };
+    const before = await snapshot();
+    ({ page, errors, context } = await newPage(browser));
+    await login(page);
+    if (await page.locator('#duplicateCodesDialog[open]').count()) await page.click('#closeDuplicateCodesBtn').catch(() => {});
+    const fillProduct = async ({ barcode, name, category, price, cost, stock: qty }) => {
+      await page.fill('#barcodeInput', barcode);
+      await page.fill('#nameInput', name);
+      await page.selectOption('#categoryInput', category);
+      await page.fill('#costInput', String(cost));
+      await page.fill('#priceInput', String(price));
+      if (qty !== undefined && !(await page.locator('#stockInput').isDisabled())) await page.fill('#stockInput', String(qty));
+      await page.evaluate(() => document.getElementById('productForm').requestSubmit());
+      await page.waitForTimeout(1200);
+    };
+    const findByBarcode = async (bc) => (await snapshot()).products.find((p) => p.barcode === bc);
+    const inProductsTable = (name) => page.locator('#productsTable', { hasText: name }).count();
+    const inSaleGrid = async (p) => {
+      await page.evaluate(() => show('pos'));
+      await page.waitForTimeout(300);
+      if (!(await page.locator(`[data-cat="${p.category}"]`).count())) return false;
+      await page.click(`[data-cat="${p.category}"]`);
+      await page.waitForTimeout(300);
+      const n = await page.locator(`#productGrid [data-add="${p.sku}"]`).count();
+      await page.keyboard.press('Escape');
+      return n > 0;
+    };
+
+    // a) alta normal
+    await page.evaluate(() => show('products'));
+    await fillProduct({ barcode: '7501000000017', name: 'Galletas Nuevas', category: 'Botanas', price: 20, cost: 12, stock: 6 });
+    let created = await findByBarcode('7501000000017');
+    check(!!created && created.stock === 6, 'a) un alta normal se guarda con su existencia');
+    check((await inProductsTable('Galletas Nuevas')) > 0, 'a) aparece en la tabla de Productos');
+    check(created && (await inSaleGrid(created)), 'a) aparece en Venta dentro de su categoria');
+
+    // b) categoria que aun no tenia productos
+    await page.evaluate(() => show('products'));
+    await fillProduct({ barcode: '7501000000024', name: 'Frijol Nuevo', category: 'Abarrotes', price: 30, cost: 20, stock: 4 });
+    created = await findByBarcode('7501000000024');
+    check(!!created && created.category === 'Abarrotes', 'b) se guarda en una categoria sin productos');
+    check(created && (await inSaleGrid(created)), 'b) aparece en Venta dentro de la categoria nueva');
+
+    // c) con texto en el buscador de Productos
+    await page.evaluate(() => show('products'));
+    await page.fill('#productSearchInput', 'galleta a');
+    await page.dispatchEvent('#productSearchInput', 'input');
+    await fillProduct({ barcode: '7501000000031', name: 'Jugo Nuevo', category: 'Bebidas', price: 15, cost: 9, stock: 3 });
+    check(!!(await findByBarcode('7501000000031')), 'c) se guarda aunque el buscador tenga texto');
+    check((await inProductsTable('Jugo Nuevo')) > 0, 'c) aparece en la tabla (el buscador se limpia)');
+
+    // d) LA FALLA: Editar desde la alerta de duplicados, salir sin guardar y dar de alta otro
+    await page.evaluate(() => editProduct('DUP-0002'));
+    check(await page.locator('#editingBanner:not(.hide)').count() > 0, 'd) al editar se ve el aviso "Editando"');
+    await page.evaluate(() => show('pos'));
+    await page.waitForTimeout(300);
+    await page.evaluate(() => show('products'));
+    check(await page.evaluate(() => document.getElementById('editingSku').value === ''), 'd) salir de Productos sin guardar cancela la edicion');
+    await fillProduct({ barcode: '7501000000048', name: 'Chocolate Nuevo', category: 'Botanas', price: 14, cost: 8, stock: 5 });
+    created = await findByBarcode('7501000000048');
+    check(!!created && created.sku !== 'DUP-0002', 'd) se crea un producto NUEVO');
+    const galletaB = (await snapshot()).products.find((p) => p.sku === 'DUP-0002');
+    check(galletaB && galletaB.name === 'Galleta B' && galletaB.barcode === '999' && galletaB.stock === 4, 'd) "Galleta B" queda intacta', JSON.stringify(galletaB));
+
+    // e) Editar y luego Cancelar edicion
+    await page.evaluate(() => editProduct('DUP-0001'));
+    await page.click('#cancelEditBtn');
+    await fillProduct({ barcode: '7501000000055', name: 'Cafe Nuevo', category: 'Abarrotes', price: 40, cost: 25, stock: 2 });
+    check(!!(await findByBarcode('7501000000055')), 'e) despues de Cancelar edicion, el alta crea un producto nuevo');
+
+    // f) una edicion que cambia nombre Y codigo pide confirmar; si se cancela no cambia nada
+    await page.evaluate(() => editProduct('DUP-0001'));
+    await fillProduct({ barcode: '7501000000062', name: 'Otra Cosa', category: 'Bebidas', price: 10, cost: 5 });
+    check(await page.locator('#confirmDialog[open]').count() > 0, 'f) cambiar nombre y codigo a la vez pide confirmacion');
+    await page.click('#cancelConfirmBtn').catch(() => {});
+    await page.waitForTimeout(500);
+    const galletaA = (await snapshot()).products.find((p) => p.sku === 'DUP-0001');
+    check(galletaA && galletaA.name === 'Galleta A' && galletaA.barcode === '999', 'f) al cancelar, el producto no cambia');
+
+    // g) nada de lo anterior toco ventas ni existencias de lo que ya habia
+    const after = await snapshot();
+    check(after.sales === before.sales, 'g) las ventas quedan intactas');
+    check(before.products.every((b) => after.products.some((a) => a.sku === b.sku && a.stock === b.stock && a.name === b.name && a.barcode === b.barcode)),
+      'g) los productos que ya existian (nombre, codigo y existencia) quedan intactos');
+    check(after.products.length === before.products.length + 5, 'g) se crearon exactamente 5 productos nuevos', `${before.products.length} -> ${after.products.length}`);
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
   } finally {
     if (browser) await browser.close().catch(() => {});
     server.kill();

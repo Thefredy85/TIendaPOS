@@ -45,7 +45,7 @@ export async function renderCajas(ctx: Ctx, el: HTMLElement) {
   const draw = async () => {
     const devices = await listDevices(ctx.business.id);
     if (!devices.length) {
-      el.innerHTML = `<div class="card empty">${icon('monitor-smartphone')}<p>Todavía no hay cajas.<br>Aparecerán aquí cuando la app de la tienda (v0.2.12 o más nueva) se conecte a internet.</p></div>`;
+      el.innerHTML = `<div class="card empty">${icon('monitor-smartphone')}<p>Todavía no hay cajas.<br>Aparecerán aquí cuando la app de la tienda (v0.2.13 o más nueva) se conecte a internet.</p></div>`;
       paintIcons();
       return;
     }
