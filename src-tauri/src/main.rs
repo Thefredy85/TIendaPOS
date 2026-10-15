@@ -2188,6 +2188,196 @@ mod tests {
     }
     fn clear_outbox(conn: &Connection) { conn.execute("DELETE FROM outbox", []).unwrap(); }
 
+    // ---------- rutina de diagnostico: partes sensibles (ver .claude/skills/diagnostico-antes-de-publicar) ----------
+
+    fn login_as(conn: &Connection, s: &mut HashMap<String, Session>, username: &str, password: &str) -> String {
+        let r = dispatch("login", &json!({"username": username, "password": password}), "", conn, s).unwrap();
+        assert_eq!(r["ok"], true, "no pudo entrar {}: {}", username, r);
+        r["sessionToken"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn cortes_x_y_z_completos() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let items = json!([{"sku":"BEB-0001","qty":2}]);
+        // con la caja cerrada no se cobra
+        assert!(dispatch("checkout", &json!({"clientId":"S0","items":items,"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).is_err());
+        dispatch("open_cash_register", &json!({"openingAmount":100}), &t, &conn, &mut s).unwrap();
+        // no se puede abrir dos veces
+        assert!(dispatch("open_cash_register", &json!({"openingAmount":50}), &t, &conn, &mut s).is_err());
+        dispatch("checkout", &json!({"clientId":"S1","items":items,"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        // pago mixto
+        dispatch("checkout", &json!({"clientId":"S2","items":items,"payments":{"Efectivo":10.0,"Tarjeta":14.0}}), &t, &conn, &mut s).unwrap();
+        // una venta cancelada no cuenta en el corte
+        dispatch("checkout", &json!({"clientId":"S3","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).unwrap();
+        dispatch("cancel_sale", &json!({"id":"S3"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 6.0);
+
+        let x = dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(x["cut"]["total"], 48.0);
+        assert_eq!(x["cut"]["salesCount"], 2);
+        assert_eq!(x["cut"]["payments"]["Efectivo"], 34.0);
+        assert_eq!(x["cut"]["payments"]["Tarjeta"], 14.0);
+        assert_eq!(x["cut"]["openingAmount"], 100.0);
+        // el X no cierra la caja: se sigue cobrando
+        dispatch("checkout", &json!({"clientId":"S4","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).unwrap();
+
+        // el Z se niega con tickets en espera o con productos sin cobrar
+        let held = dispatch("cash_cut", &json!({"type":"z","pendingHeldTickets":1}), &t, &conn, &mut s);
+        assert!(held.unwrap_err().contains("en espera"));
+        assert!(dispatch("cash_cut", &json!({"type":"z","pendingCartItems":2}), &t, &conn, &mut s).is_err());
+        let z = dispatch("cash_cut", &json!({"type":"z"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(z["cut"]["total"], 60.0);
+        assert_eq!(z["cut"]["salesCount"], 3);
+        // despues del Z la caja queda cerrada y no se cobra
+        assert!(dispatch("checkout", &json!({"clientId":"S5","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).is_err());
+        assert!(dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).is_err());
+        // y se puede abrir un turno nuevo, que empieza en cero
+        dispatch("open_cash_register", &json!({"openingAmount":80}), &t, &conn, &mut s).unwrap();
+        let x2 = dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(x2["cut"]["total"], 0.0);
+        assert_eq!(x2["cut"]["salesCount"], 0);
+        assert_eq!(stock_of(&conn, "BEB-0001"), 5.0);
+    }
+
+    #[test]
+    fn cancelar_dos_veces_no_devuelve_inventario_doble() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":3}],"payments":{"Efectivo":36.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 7.0);
+        dispatch("cancel_sale", &json!({"id":"S1"}), &t, &conn, &mut s).unwrap();
+        assert!(dispatch("cancel_sale", &json!({"id":"S1"}), &t, &conn, &mut s).is_err());
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+    }
+
+    #[test]
+    fn un_cajero_cobra_y_corta_pero_no_edita_productos_ni_inventario() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("save_user", &json!({"username":"2001","password":"5678","displayName":"Ana","role":"cajero"}), &t, &conn, &mut s).unwrap();
+        let c = login_as(&conn, &mut s, "2001", "5678");
+        dispatch("open_cash_register", &json!({"openingAmount":100}), &c, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &c, &conn, &mut s).unwrap();
+        dispatch("cash_cut", &json!({"type":"x"}), &c, &conn, &mut s).unwrap();
+        assert!(dispatch("save_product", &json!({"mode":"new","record":{"barcode":"222","name":"X","category":"Bebidas","price":1,"cost":1}}), &c, &conn, &mut s).is_err());
+        assert!(dispatch("save_product", &json!({"mode":"edit","editingSku":"BEB-0001","record":{"barcode":"111","name":"Agua","category":"Bebidas","price":1,"cost":1}}), &c, &conn, &mut s).is_err());
+        assert!(dispatch("movement", &json!({"sku":"BEB-0001","type":"entrada_compra","quantity":50}), &c, &conn, &mut s).is_err());
+        assert!(dispatch("count", &json!({"sku":"BEB-0001","countedStock":99}), &c, &conn, &mut s).is_err());
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["price"], 12.0);
+        assert_eq!(stock_of(&conn, "BEB-0001"), 9.0);
+        dispatch("cash_cut", &json!({"type":"z"}), &c, &conn, &mut s).unwrap();
+    }
+
+    // Base de datos "como la dejo" una version vieja: solo la tabla store_data, sin outbox.
+    fn old_db(rows: &[(&str, &str, Value)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE store_data (store TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (store, id))", []).unwrap();
+        for (store, id, data) in rows {
+            conn.execute("INSERT INTO store_data (store, id, data) VALUES (?1, ?2, ?3)", params![store, id, data.to_string()]).unwrap();
+        }
+        conn
+    }
+    fn old_user(username: &str, password: &str, role: &str) -> Value {
+        let salt = format!("salvieja{}", username);
+        json!({"username":username,"displayName":format!("Usuario {}", username),"passwordHash":hash_password(password, &salt),"salt":salt,"role":role,"pin":"","active":true,"createdAt":"2026-01-01T00:00:00.000Z","lastLogin":""})
+    }
+    fn old_product(sku: &str, barcode: &str, name: &str, category: &str, price: f64, stock: f64) -> Value {
+        let (ci, cw) = iva_parts(price / 2.0);
+        let (pi, pw) = iva_parts(price);
+        json!({"sku":sku,"barcode":barcode,"name":name,"category":category,"presentation":"Pieza","supplier":"","unit":"pieza","cost":price/2.0,"price":price,"costIva":ci,"priceIva":pi,"costWithoutIva":cw,"priceWithoutIva":pw,"stock":stock,"minStock":2,"description":"","active":true})
+    }
+    // Productos que no se vendieron ni se tocaron deben quedar exactamente igual.
+    fn untouched(before: &[(String, String, String)], conn: &Connection, skus: &[&str]) {
+        for sku in skus {
+            let old = before.iter().find(|(st, id, _)| st == "products" && id == sku).map(|(_, _, d)| d.clone()).unwrap();
+            let now = get_item(conn, "products", sku).unwrap().to_string();
+            let old_v: Value = serde_json::from_str(&old).unwrap();
+            assert_eq!(old_v.to_string(), now, "el producto {} cambio", sku);
+        }
+    }
+
+    #[test]
+    fn la_version_nueva_abre_una_base_de_la_v0_1_2_sin_perder_nada() {
+        // v0.1.2: sin caja (ni apertura ni cortes), sin permisos por rol, ventas sin desglose de pago
+        let conn = old_db(&[
+            ("users", "1234", old_user("1234", "1234", "admin")),
+            ("products", "BEB-0001", old_product("BEB-0001", "7501", "Agua", "Bebidas", 12.0, 10.0)),
+            ("products", "ABA-0001", old_product("ABA-0001", "", "Frijol granel", "Abarrotes", 9.0, 20.0)),
+            ("products", "BOT-0001", old_product("BOT-0001", "7502", "Papas", "Botanas", 18.0, 5.0)),
+            ("sales", "SALE-1700000000000", json!({"id":"SALE-1700000000000","timestamp":"2026-01-10T10:00:00.000Z","itemsJson":"[{\"sku\":\"BEB-0001\",\"qty\":1}]","subtotal":12,"discount":0,"total":12,"paymentMethod":"Efectivo","user":"Usuario 1234","notes":"","profit":6})),
+            ("moves", "MOV-1700000000000-BEB-0001", json!({"id":"MOV-1700000000000-BEB-0001","timestamp":"2026-01-10T10:00:00.000Z","type":"venta","sku":"BEB-0001","productName":"Agua","quantity":-1,"stockBefore":11,"stockAfter":10,"unitCost":6,"totalCost":-6,"reason":"Venta POS","reference":"SALE-1700000000000","user":"Usuario 1234","notes":""})),
+            ("settings", "app", json!({"key":"app","value":"{\"storeTitle\":\"Abarrotes Viejo\"}"})),
+        ]);
+        let before = snapshot(&conn);
+        init_db(&conn);
+        assert_eq!(before, snapshot(&conn), "abrir con la version nueva no debe cambiar ningun dato");
+
+        let mut s = HashMap::new();
+        let t = login_as(&conn, &mut s, "1234", "1234");
+        let data = dispatch("data", &json!({}), &t, &conn, &mut s).unwrap();
+        assert_eq!(data["products"].as_array().unwrap().len(), 3);
+        assert_eq!(data["sales"].as_array().unwrap().len(), 1);
+        assert_eq!(read_settings(&conn)["storeTitle"], "Abarrotes Viejo");
+
+        // cobrar un producto viejo y uno SIN codigo de barras
+        dispatch("open_cash_register", &json!({"openingAmount":100}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S-NUEVA","items":[{"sku":"BEB-0001","qty":1},{"sku":"ABA-0001","qty":2}],"payments":{"Efectivo":30.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 9.0);
+        assert_eq!(stock_of(&conn, "ABA-0001"), 18.0);
+        // dar de alta un producto nuevo
+        dispatch("save_product", &json!({"mode":"new","record":{"barcode":"7503","name":"Jugo","category":"Bebidas","price":15,"cost":9,"stock":4}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(list_items(&conn, "products").len(), 4);
+        // corte Z con la venta nueva
+        let z = dispatch("cash_cut", &json!({"type":"z"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(z["cut"]["total"], 30.0);
+        // lo que no se vendio queda identico; la venta vieja sigue ahi
+        untouched(&before, &conn, &["BOT-0001"]);
+        assert!(get_item(&conn, "sales", "SALE-1700000000000").is_some());
+        assert_eq!(list_items(&conn, "sales").len(), 2);
+    }
+
+    #[test]
+    fn la_version_nueva_abre_una_base_de_la_v0_2_7_sin_perder_nada() {
+        // v0.2.7: caja abierta a medio turno, cortes viejos, codigos de barras duplicados, sin permisos por rol
+        let conn = old_db(&[
+            ("users", "1234", old_user("1234", "1234", "admin")),
+            ("users", "2001", old_user("2001", "5678", "cajero")),
+            ("products", "BEB-0001", old_product("BEB-0001", "7501", "Agua", "Bebidas", 12.0, 10.0)),
+            ("products", "GAL-0001", old_product("GAL-0001", "999", "Galleta A", "Botanas", 10.0, 3.0)),
+            ("products", "GAL-0002", old_product("GAL-0002", "999", "Galleta B", "Botanas", 11.0, 4.0)),
+            ("cash_state", "current", json!({"periodStart":"2026-10-01T08:00:00.000Z","openingAmount":200,"isOpen":true})),
+            ("cash_cuts", "CORTEZ-1759000000000-abc123", json!({"id":"CORTEZ-1759000000000-abc123","type":"z","timestamp":"2026-09-30T21:00:00.000Z","periodStart":"2026-09-30T08:00:00.000Z","periodEnd":"2026-09-30T21:00:00.000Z","openingAmount":200,"total":540,"salesCount":12,"payments":{"Efectivo":540},"user":"Usuario 1234","notes":""})),
+            ("sales", "SALE-1759300000000", json!({"id":"SALE-1759300000000","timestamp":"2026-10-01T09:00:00.000Z","itemsJson":"[{\"sku\":\"BEB-0001\",\"qty\":1}]","subtotal":12,"discount":0,"total":12,"paymentMethod":"Efectivo","paymentBreakdown":{"Efectivo":12},"user":"Usuario 2001","notes":"","profit":6})),
+        ]);
+        let before = snapshot(&conn);
+        init_db(&conn);
+        assert_eq!(before, snapshot(&conn), "abrir con la version nueva no debe cambiar ningun dato");
+
+        let mut s = HashMap::new();
+        // el cajero viejo entra y sigue con el turno que ya estaba abierto
+        let c = login_as(&conn, &mut s, "2001", "5678");
+        dispatch("checkout", &json!({"clientId":"S-NUEVA","items":[{"sku":"BEB-0001","qty":2}],"payments":{"Efectivo":24.0}}), &c, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+        // el Z del cajero incluye la venta vieja del turno y la nueva
+        let z = dispatch("cash_cut", &json!({"type":"z"}), &c, &conn, &mut s).unwrap();
+        assert_eq!(z["cut"]["total"], 36.0);
+        assert_eq!(z["cut"]["openingAmount"], 200.0);
+        // los duplicados siguen igual: nunca se corrigen solos
+        untouched(&before, &conn, &["GAL-0001", "GAL-0002"]);
+        // el admin da de alta un producto: no puede reutilizar el codigo duplicado, y lo demas no cambia
+        let a = login_as(&conn, &mut s, "1234", "1234");
+        assert!(dispatch("save_product", &json!({"mode":"new","record":{"barcode":"999","name":"Galleta C","category":"Botanas","price":9,"cost":5}}), &a, &conn, &mut s).is_err());
+        dispatch("save_product", &json!({"mode":"new","record":{"barcode":"7504","name":"Cafe","category":"Abarrotes","price":40,"cost":25,"stock":2}}), &a, &conn, &mut s).unwrap();
+        assert_eq!(list_items(&conn, "products").len(), 4);
+        untouched(&before, &conn, &["GAL-0001", "GAL-0002"]);
+        // el corte viejo y la venta vieja siguen ahi
+        assert!(get_item(&conn, "cash_cuts", "CORTEZ-1759000000000-abc123").is_some());
+        assert!(get_item(&conn, "sales", "SALE-1759300000000").is_some());
+    }
+
     #[test]
     fn la_cola_anota_cada_cambio_una_sola_vez() {
         let (conn, mut s, t) = fresh();
