@@ -313,6 +313,96 @@ async function main() {
     check(after.products.length === before.products.length + 5, 'g) se crearon exactamente 5 productos nuevos', `${before.products.length} -> ${after.products.length}`);
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
+
+    // La ventana de impresion se reemplaza por una falsa para no esperar a una impresora.
+    const fakePrint = () => {
+      const w = { document: { open() {}, write() {}, close() {} }, focus() {}, print() {}, close() {} };
+      window.open = () => w;
+    };
+    const dataNow = async () => call('data', {}, (await call('login', { code: '1234' })).sessionToken);
+    const sellByScan = async (code) => {
+      await page.fill('#scanInput', code);
+      await page.press('#scanInput', 'Enter');
+      await page.waitForTimeout(300);
+      await pay(page);
+      await page.waitForSelector('#receiptDialog[open]', { timeout: 8000 }).catch(() => {});
+      await page.click('#closeReceiptBtn').catch(() => {});
+      await page.waitForTimeout(300);
+    };
+
+    console.log('\n6) Caja, Corte X, cancelar una venta y Corte Z desde la pantalla');
+    await seed();
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await login(page);
+    await openCash(page);
+    await sellByScan('111');   // Agua 12.5
+    await sellByScan('222');   // Refresco 18
+    let d = await dataNow();
+    check((d.sales || []).length === 2, '6) se registran las dos ventas', `ventas: ${(d.sales || []).length}`);
+
+    await page.evaluate(() => show('cashcut'));
+    await page.click('#cashCutXBtn');
+    await page.waitForTimeout(1200);
+    d = await dataNow();
+    const xs = (d.cashCuts || []).filter((c) => c.type === 'x');
+    check(xs.length === 1 && xs[0].total === 30.5 && xs[0].salesCount === 2, '6) el Corte X suma las ventas del turno', JSON.stringify(xs.map((c) => [c.total, c.salesCount])));
+    check(d.cashState && d.cashState.isOpen === true, '6) el Corte X no cierra la caja');
+
+    const refrescoSale = (d.sales || []).find((s) => String(s.itemsJson || '').includes('P1759000000000ABC'));
+    await page.evaluate(() => show('sales'));
+    await page.waitForTimeout(400);
+    await page.click(`[data-cancel-sale="${refrescoSale.id}"]`);
+    await page.waitForSelector('#confirmDialog[open]', { timeout: 4000 }).catch(() => {});
+    await page.click('#acceptConfirmBtn');
+    await page.waitForTimeout(1200);
+    check((await stock('P1759000000000ABC')) === 5, '6) cancelar la venta devuelve el Refresco al inventario (4 -> 5)');
+    check((await page.locator(`[data-cancel-sale="${refrescoSale.id}"]`).count()) === 0, '6) una venta cancelada ya no se puede cancelar otra vez');
+    check((await stock('P1759000000000ABC')) === 5, '6) el inventario se devuelve una sola vez');
+
+    // con un producto en el ticket, el Corte Z no se permite
+    await page.evaluate(() => show('pos'));
+    await tapProduct(page, 'BEB-0001');
+    await page.evaluate(() => show('cashcut'));
+    await page.click('#cashCutZBtn');
+    await page.waitForTimeout(500);
+    check((await page.locator('#confirmZDialog[open]').count()) === 0, '6) el Corte Z se niega con un ticket sin cobrar');
+    try { await toastHas(page, 'No se puede cerrar el turno'); ok('6) avisa por que no se puede hacer el Corte Z'); } catch { bad('6) avisa por que no se puede hacer el Corte Z'); }
+    await page.evaluate(() => { state.cart = []; saveCartDraft(); renderCart(); });   // se vacia el ticket
+
+    await page.click('#cashCutZBtn');
+    await page.waitForSelector('#confirmZDialog[open]', { timeout: 4000 }).catch(() => {});
+    await page.click('#confirmZBtn');
+    await page.waitForTimeout(1500);
+    d = await dataNow();
+    const zs = (d.cashCuts || []).filter((c) => c.type === 'z');
+    check(zs.length === 1 && zs[0].total === 12.5 && zs[0].salesCount === 1, '6) el Corte Z no cuenta la venta cancelada', JSON.stringify(zs.map((c) => [c.total, c.salesCount])));
+    check(d.cashState && d.cashState.isOpen === false, '6) el Corte Z cierra la caja');
+    check((await stock('BEB-0001')) === 9 && (await stock('GRA-0001')) === 7, '6) el inventario solo cambio por lo vendido');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    console.log('\n7) Un cajero abre caja, cobra y hace su corte desde la pantalla');
+    await seed();
+    const boss7 = await call('login', { code: '1234' });
+    await call('save_user', { username: '2001', password: '2001', displayName: 'Ana', role: 'cajero' }, boss7.sessionToken);
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await page.fill('#authCode', '2001');
+    await page.press('#authCode', 'Enter');
+    await page.waitForFunction(() => !document.body.classList.contains('locked'), null, { timeout: 8000 });
+    check(await page.evaluate(() => state.user && state.user.role === 'cajero'), '7) el cajero entra con su clave');
+    await openCash(page);
+    await sellByScan('111');
+    check((await stock('BEB-0001')) === 9, '7) el cajero cobra y descuenta inventario');
+    await page.evaluate(() => show('cashcut'));
+    await page.click('#cashCutXBtn');
+    await page.waitForTimeout(1200);
+    d = await dataNow();
+    check((d.cashCuts || []).some((c) => c.type === 'x' && c.total === 12.5), '7) el cajero hace su Corte X');
+    check(await page.evaluate(() => !canManage()), '7) el cajero no puede administrar productos');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
   } finally {
     if (browser) await browser.close().catch(() => {});
     server.kill();
