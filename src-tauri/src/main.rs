@@ -226,11 +226,13 @@ fn list_items(conn: &Connection, store: &str) -> Vec<Value> {
 // todo el historial (con meses de ventas, cargarlo todo hacia lenta la caja).
 // from/to vacios = sin limite por ese lado.
 fn list_items_between(conn: &Connection, store: &str, from: &str, to: &str) -> Vec<Value> {
-    let sql = "SELECT data FROM store_data WHERE store = ?1
-               AND (?2 = '' OR json_extract(data, '$.timestamp') >= ?2)
-               AND (?3 = '' OR json_extract(data, '$.timestamp') < ?3)";
-    let mut stmt = match conn.prepare(sql) { Ok(s) => s, Err(_) => return vec![] };
-    let rows = match stmt.query_map(params![store, from, to], |row| row.get::<_, String>(0)) { Ok(r) => r, Err(_) => return vec![] };
+    // Se arma solo con los limites que vengan, para que SQLite use idx_store_data_fecha.
+    let mut sql = String::from("SELECT data FROM store_data WHERE store = ?1");
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&store];
+    if !from.is_empty() { sql.push_str(" AND json_extract(data, '$.timestamp') >= ?2"); args.push(&from); }
+    if !to.is_empty() { sql.push_str(if from.is_empty() { " AND json_extract(data, '$.timestamp') < ?2" } else { " AND json_extract(data, '$.timestamp') < ?3" }); args.push(&to); }
+    let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return vec![] };
+    let rows = match stmt.query_map(args.as_slice(), |row| row.get::<_, String>(0)) { Ok(r) => r, Err(_) => return vec![] };
     rows.filter_map(|r| r.ok()).filter_map(|s| serde_json::from_str::<Value>(&s).ok()).collect()
 }
 
@@ -908,16 +910,34 @@ fn op_data(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &s
     let presentations = list_items(conn, "presentations");
     let users: Vec<Value> = if admin { list_items(conn, "users").iter().map(public_user).collect() } else { vec![] };
     let cash_cuts = list_items_between(conn, "cash_cuts", &since, "");
+    // mermas del mes (hora local de la PC), sin cargar todos los movimientos del mes
+    let month_start = {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+            .map(|dt| dt.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true))
+            .unwrap_or_default()
+    };
+    let waste_month: f64 = if sees_ops {
+        list_items_between(conn, "moves", &month_start, "").iter()
+            .filter(|m| clean_text(m.get("type")) == "merma")
+            .map(|m| num_of(m.get("totalCost")).abs()).sum()
+    } else { 0.0 };
     Ok(json!({
         "ok": true, "user": public_user(&user), "products": products, "moves": moves,
         "counts": counts, "sales": sales, "users": users, "settings": settings,
         "categories": categories, "units": units, "suppliers": suppliers, "presentations": presentations,
         "cashState": cash_state, "cashCuts": cash_cuts, "rolePermissions": perms,
-        "historyFrom": since
+        "historyFrom": since,
+        "summary": {"wasteMonth": waste_month}
     }))
 }
 
-const HISTORY_DAYS_LOADED: i64 = 45;
+// Al abrir: 8 dias (resumen de hoy, grafica de 7 dias). Las tablas de historial piden
+// su rango (30 dias por defecto, o cualquier fecha) solo cuando se abren.
+const HISTORY_DAYS_LOADED: i64 = 8;
 
 // Consulta del historial por fechas (todo lo guardado, sin limite de antiguedad).
 // from/to: instantes ISO (la pantalla los calcula con la hora local del dia elegido).
@@ -1659,6 +1679,13 @@ fn init_db(conn: &Connection) {
         [],
     )
     .expect("no se pudo crear la tabla store_data");
+    // v0.2.13: indice por fecha para leer historial por rango sin revisar todas las filas.
+    // Solo se agrega; no cambia ningun dato. La expresion debe ser IGUAL a la de list_items_between.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_store_data_fecha ON store_data (store, json_extract(data, '$.timestamp'))",
+        [],
+    )
+    .ok();
 }
 
 // ---------- panel web (Supabase) - solo lectura por ahora ----------
@@ -2081,10 +2108,10 @@ mod tests {
     }
 
     #[test]
-    fn al_abrir_carga_45_dias_y_el_historial_encuentra_lo_anterior() {
+    fn al_abrir_carga_pocos_dias_y_el_historial_encuentra_lo_anterior() {
         let (conn, mut s, t) = fresh();
         let old = (Utc::now() - chrono::Duration::days(60)).to_rfc3339_opts(SecondsFormat::Millis, true);
-        let recent = (Utc::now() - chrono::Duration::days(10)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let recent = (Utc::now() - chrono::Duration::days(3)).to_rfc3339_opts(SecondsFormat::Millis, true);
         for (id, ts) in [("S-VIEJA", &old), ("S-RECIENTE", &recent)] {
             create_item(&conn, "sales", id, &json!({"id": id, "timestamp": ts, "itemsJson": "[]", "total": 5, "paymentMethod": "Efectivo"})).unwrap();
             create_item(&conn, "moves", &format!("M-{}", id), &json!({"id": format!("M-{}", id), "timestamp": ts, "type": "entrada_compra", "sku": "X", "quantity": 1})).unwrap();
@@ -2313,6 +2340,31 @@ mod tests {
                 "__test_put_product" => {
                     let sku = clean_text(payload.get("sku"));
                     create_item(&conn, "products", &sku, &payload).unwrap();
+                    json!({"ok": true})
+                }
+                // registro con cualquier forma y fecha (p. ej. una venta de hace 60 dias)
+                "__test_put_item" => {
+                    let store = clean_text(payload.get("store"));
+                    let id = clean_text(payload.get("id"));
+                    create_item(&conn, &store, &id, payload.get("data").unwrap_or(&json!({}))).unwrap();
+                    json!({"ok": true})
+                }
+                // carga rapida de N ventas (con sus 2 movimientos) repartidas en los ultimos 60 dias,
+                // para la prueba de volumen. No pasa por el cobro: solo llena el historial.
+                "__test_bulk_sales" => {
+                    let n = num_of(payload.get("n")) as i64;
+                    conn.execute_batch("BEGIN").unwrap();
+                    for i in 0..n {
+                        let ts = (Utc::now() - chrono::Duration::minutes((n - i) * 60 * 24 * 60 / n.max(1))).to_rfc3339_opts(SecondsFormat::Millis, true);
+                        let id = format!("BULK-{}", i);
+                        let items = json!([{"sku":"GRA-0001","qty":1,"name":"Granel","price":9.0,"cost":4.5},{"sku":"GRA-0001","qty":1,"name":"Granel","price":9.0,"cost":4.5}]).to_string();
+                        create_item(&conn, "sales", &id, &json!({"id":id,"timestamp":ts,"itemsJson":items,"subtotal":18.0,"discount":0,"total":18.0,"paymentMethod":"Efectivo","paymentBreakdown":{"Efectivo":18.0},"user":"Admin","notes":"","profit":9.0})).unwrap();
+                        for k in 0..2 {
+                            let mid = format!("MOV-BULK-{}-{}", i, k);
+                            create_item(&conn, "moves", &mid, &json!({"id":mid,"timestamp":ts,"type":"venta","sku":"GRA-0001","productName":"Granel","quantity":-1,"stockBefore":0,"stockAfter":0,"unitCost":4.5,"totalCost":-4.5,"reason":"Venta POS","reference":id,"user":"Admin","notes":""})).unwrap();
+                        }
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
                     json!({"ok": true})
                 }
                 "__test_get_product" => {

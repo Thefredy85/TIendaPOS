@@ -403,6 +403,91 @@ async function main() {
     check(await page.evaluate(() => !canManage()), '7) el cajero no puede administrar productos');
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
+
+    // Falla reportada: "a veces no se descuentan los productos" y "toma mal los códigos".
+    console.log('\n8) Método de descuento: ceros a la izquierda, códigos repetidos y productos sin existencia');
+    await seed([product('DUP-0001', '0750100', 'Galleta A', 10, 3), product('DUP-0002', '750100', 'Galleta B', 11, 4), product('CERO-001', '555', 'Chicle', 5, 0)]);
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await login(page);
+    try { await page.waitForSelector('#duplicateCodesDialog[open]', { timeout: 4000 }); ok('8) al entrar avisa que 0750100 y 750100 son el mismo código'); } catch { bad('8) al entrar avisa que 0750100 y 750100 son el mismo código'); }
+    await page.click('#closeDuplicateCodesBtn').catch(() => {});
+    await openCash(page);
+    const scan = async (code) => { await page.fill('#scanInput', code); await page.press('#scanInput', 'Enter'); await page.waitForTimeout(300); };
+    await scan('0111');
+    check(await page.evaluate(() => state.cart.some((l) => l.sku === 'BEB-0001')), '8) un código con un cero de más se reconoce (0111 = 111)');
+    await scan('750100');
+    check((await page.locator('#dupScanDialog[open]').count()) > 0, '8) un código repetido abre la ventana "¿cuál producto es?"');
+    check((await page.locator('#dupScanList [data-dup-fix]').count()) === 2, '8) la ventana ofrece Corregir para cada producto');
+    await page.click('[data-dup-sell="DUP-0002"]');
+    await page.waitForTimeout(300);
+    check(await page.evaluate(() => state.cart.some((l) => l.sku === 'DUP-0002') && !state.cart.some((l) => l.sku === 'DUP-0001')), '8) se vende el producto elegido, no el primero de la lista');
+    await scan('555');
+    check(await page.evaluate(() => state.cart.some((l) => l.sku === 'CERO-001')), '8) un producto sin existencia se puede vender');
+    check((await page.locator('#lowStockDialog[open]').count()) > 0, '8) avisa "inventario bajo" al agregar un producto sin existencia');
+    await page.click('#lowStockOkBtn').catch(() => {});   // el cajero pulsa Entendido
+    await page.waitForTimeout(200);
+    await pay(page);
+    await page.waitForSelector('#receiptDialog[open]', { timeout: 8000 }).catch(() => {});
+    await page.click('#closeReceiptBtn').catch(() => {});
+    await page.waitForTimeout(800);
+    const s8 = [await stock('BEB-0001'), await stock('DUP-0002'), await stock('CERO-001')];
+    check(JSON.stringify(s8) === JSON.stringify([9, 3, -1]), '8) cada producto se descuenta exacto en la base (Agua 9, Galleta B 3, Chicle -1)', JSON.stringify(s8));
+    check((await stock('DUP-0001')) === 3, '8) el otro producto con el código repetido no se toca');
+    const shown8 = await page.evaluate(() => ['BEB-0001', 'DUP-0002', 'CERO-001'].map((s) => state.products.find((p) => p.sku === s)?.stock));
+    check(JSON.stringify(shown8) === JSON.stringify([9, 3, -1]), '8) la pantalla muestra las existencias ya descontadas', JSON.stringify(shown8));
+    try { await toastHas(page, 'Quedaron en negativo', 4000); ok('8) avisa qué productos quedaron en negativo'); } catch { bad('8) avisa qué productos quedaron en negativo'); }
+    await page.evaluate(() => openDiagnostics());
+    await page.waitForSelector('#diagDialog[open]', { timeout: 5000 }).catch(() => {});
+    const diagText = await page.locator('#diagBody').innerText().catch(() => '');
+    check(/Códigos repetidos \(1\)/.test(diagText) && /Existencia negativa \(1\)/.test(diagText), '8) el diagnóstico muestra el código repetido y la existencia negativa', diagText.slice(0, 160));
+    check((await stock('DUP-0001')) === 3 && (await stock('DUP-0002')) === 3 && (await stock('CERO-001')) === -1, '8) el diagnóstico no corrige nada solo');
+    await page.click('#closeDiagBtn').catch(() => {});
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    console.log('\n9) Historial: 30 días en pantalla y cualquier fecha con el filtro');
+    await seed();
+    const daysAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
+    await call('__test_put_item', { store: 'sales', id: 'S-HACE-60', data: { id: 'S-HACE-60', timestamp: daysAgo(60), itemsJson: '[]', total: 77, paymentMethod: 'Efectivo', user: 'Admin' } });
+    await call('__test_put_item', { store: 'sales', id: 'S-AYER', data: { id: 'S-AYER', timestamp: daysAgo(1), itemsJson: '[]', total: 5, paymentMethod: 'Efectivo', user: 'Admin' } });
+    ({ page, errors, context } = await newPage(browser));
+    await login(page);
+    await page.evaluate(() => show('sales'));
+    await page.waitForTimeout(400);
+    check((await page.locator('#salesTable', { hasText: 'S-AYER' }).count()) > 0, '9) la venta de ayer se ve sin filtrar');
+    check((await page.locator('#salesTable', { hasText: 'S-HACE-60' }).count()) === 0, '9) por defecto se muestran los últimos 30 días');
+    const d70 = await page.evaluate(() => { const d = new Date(); d.setDate(d.getDate() - 70); return localDay(d); });
+    await page.fill('.history-range[data-kind="sales"] [data-range-from]', d70);
+    await page.dispatchEvent('.history-range[data-kind="sales"] [data-range-from]', 'change');
+    await page.waitForTimeout(1200);
+    check((await page.locator('#salesTable', { hasText: 'S-HACE-60' }).count()) > 0, '9) con el filtro aparece la venta de hace 60 días (no se borró)');
+    check((await page.locator('#salesTable', { hasText: 'S-AYER' }).count()) > 0, '9) y también las recientes');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    // Falla encontrada: con ~2 meses de historial la copia del navegador llenaba su límite y la app dejaba de abrir.
+    console.log('\n10) Volumen: 7,000 ventas (~2 meses) y una copia vieja casi llena en el navegador');
+    await seed();
+    await call('__test_bulk_sales', { n: 7000 });
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await page.evaluate(() => { try { localStorage.setItem('tiendaInventarioCacheV2', 'x'.repeat(4500000)); } catch (_) {} });
+    const t10 = Date.now();
+    await page.fill('#authCode', '1234');
+    await page.press('#authCode', 'Enter');
+    const in10 = await page.waitForFunction(() => !document.body.classList.contains('locked'), null, { timeout: 30000 }).then(() => true).catch(() => false);
+    check(in10, `10) la app abre con 7,000 ventas acumuladas (${Math.round((Date.now() - t10) / 100) / 10} s)`);
+    if (in10) {
+      await openCash(page);
+      await sellByScan('111');
+      check((await stock('BEB-0001')) === 9, '10) la base descuenta');
+      check(await page.evaluate(() => state.products.find((p) => p.sku === 'BEB-0001')?.stock) === 9, '10) la pantalla muestra lo descontado');
+      const chars = await page.evaluate(() => Object.keys(localStorage).reduce((a, k) => a + (localStorage.getItem(k) || '').length, 0));
+      check(chars < 1000000, '10) la copia del navegador quedó pequeña (se borró la vieja)', `${chars} caracteres`);
+    }
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
   } finally {
     if (browser) await browser.close().catch(() => {});
     server.kill();
