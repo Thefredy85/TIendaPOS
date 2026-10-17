@@ -3168,6 +3168,16 @@ mod tests {
                     create_item(&conn, "products", &sku, &payload).unwrap();
                     json!({"ok": true})
                 }
+                // licencia firmada con la llave de prueba: vence en `days` dias (0 = hoy)
+                "__test_license" => {
+                    let d = num_of(payload.get("days")) as i64;
+                    let mut l = lic(today() + days(d), truthy_opt(payload.get("enforce")));
+                    if let Some(mv) = payload.get("minVersion") { l["min_version"] = mv.clone(); }
+                    give(&conn, &l);
+                    license_status(&conn)
+                }
+                // codigo por telefono de hoy para la licencia de prueba
+                "__test_unlock_code" => json!({"code": unlock_code_for("TP-TEST", "abc123", today())}),
                 // registro con cualquier forma y fecha (p. ej. una venta de hace 60 dias)
                 "__test_put_item" => {
                     let store = clean_text(payload.get("store"));

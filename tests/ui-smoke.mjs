@@ -73,7 +73,7 @@ async function newPage(browser) {
       tauri: {
         invoke: async (cmd, args) => {
           if (cmd === 'backend_call') return await window.__bridge(args.op, args.payload || {}, args.sessionToken || '');
-          if (cmd === 'check_license') return { licenseKey: 'TEST', status: 'activo', ok: true };
+          if (cmd === 'check_license') return await window.__bridge('license_status', {}, '');
           if (cmd === 'check_for_update') return { available: false };
           return { ok: true };
         },
@@ -501,6 +501,63 @@ async function main() {
     check(/Luis Viejo/.test(cutTxt), '11) un corte viejo se muestra con SU usuario (no el de hoy)', cutTxt.slice(0, 120));
     check(/Fondo inicial/.test(cutTxt) && /Efectivo esperado/.test(cutTxt), '11) el corte muestra fondo inicial y efectivo esperado');
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    console.log('\n12) Licencia: aviso de 3 días, bloqueo (con corte permitido) y código por teléfono');
+    await seed();
+    await call('__test_license', { days: 2, enforce: true });
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await login(page);
+    await openCash(page);
+    await page.evaluate(() => refreshLicense());
+    await page.waitForTimeout(400);
+    const banner12 = await page.locator('#licenseBanner').innerText().catch(() => '');
+    check(/vence el/.test(banner12) && /55 4297 3399/.test(banner12) && /Monto/.test(banner12), '12) aviso: el encargado ve fecha, monto y contacto', banner12);
+    await call('__test_license', { days: 0, enforce: true });
+    await page.evaluate(() => refreshLicense());
+    await page.waitForTimeout(400);
+    check(await page.locator('#licenseOverlay').isVisible(), '12) con el bloqueo encendido y vencida, sale la pantalla de suspensión');
+    const before12 = await stock('BEB-0001');
+    const r12 = await call('checkout', { clientId: 'S-BLOQ', items: [{ sku: 'BEB-0001', qty: 1 }], payments: { Efectivo: 12.5 } }, (await call('login', { code: '1234' })).sessionToken);
+    check(r12.ok === false && /BLOQUEO/.test(r12.error || ''), '12) suspendido: no se puede cobrar', JSON.stringify(r12));
+    check((await stock('BEB-0001')) === before12, '12) suspendido: el inventario no cambia');
+    await page.click('#licenseCutBtn');
+    await page.waitForTimeout(400);
+    check(!(await page.locator('#licenseOverlay').isVisible()) && (await page.locator('#licenseBanner').isVisible()), '12) se puede ir al corte (queda solo la barra roja)');
+    await page.click('#cashCutXBtn');
+    await page.waitForTimeout(1200);
+    check(((await dataNow()).cashCuts || []).some((c) => c.type === 'x'), '12) suspendido: el Corte X sí se puede hacer');
+    await page.evaluate(() => show('pos'));
+    await page.waitForTimeout(300);
+    await page.evaluate(() => refreshLicense());
+    await page.waitForTimeout(300);
+    await page.fill('#licenseCodeInput', 'ABCD1234');
+    await page.click('#licenseCodeBtn');
+    await page.waitForTimeout(500);
+    check(await page.locator('#licenseOverlay').isVisible(), '12) un código equivocado no desbloquea');
+    const code12 = (await call('__test_unlock_code')).code;
+    await page.fill('#licenseCodeInput', code12);
+    await page.click('#licenseCodeBtn');
+    await page.waitForTimeout(600);
+    check(!(await page.locator('#licenseOverlay').isVisible()), '12) el código por teléfono desbloquea');
+    await sellByScan('111');
+    check((await stock('BEB-0001')) === before12 - 1, '12) después del código se vuelve a cobrar y descuenta');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+    // el cajero ve un aviso simple
+    await seed();
+    await call('__test_license', { days: 1, enforce: true });
+    const boss12 = await call('login', { code: '1234' });
+    await call('save_user', { username: '2001', password: '2001', displayName: 'Ana', role: 'cajero' }, boss12.sessionToken);
+    ({ page, errors, context } = await newPage(browser));
+    await page.fill('#authCode', '2001');
+    await page.press('#authCode', 'Enter');
+    await page.waitForFunction(() => !document.body.classList.contains('locked'), null, { timeout: 8000 });
+    await page.evaluate(() => refreshLicense());
+    await page.waitForTimeout(400);
+    const bannerC = await page.locator('#licenseBanner').innerText().catch(() => '');
+    check(/Avísale al encargado/.test(bannerC) && !/Monto/.test(bannerC), '12) el cajero ve "Avísale al encargado" (sin montos)', bannerC);
     await context.close();
 
     // Falla encontrada: con ~2 meses de historial la copia del navegador llenaba su límite y la app dejaba de abrir.
