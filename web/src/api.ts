@@ -117,3 +117,50 @@ export function watchBusiness(businessId: string, onChange: (table: string) => v
   ch.subscribe();
   return () => { void sb.removeChannel(ch); };
 }
+
+// ---------- licencias (solo superadmin; columnas sin el secreto del código) ----------
+
+export interface License {
+  business_id: string; cut_day: number; monthly_amount: number; paid_until: string;
+  enforce: boolean; notes: string | null; updated_at: string;
+}
+export interface LicensePayment {
+  id: string; business_id: string; paid_at: string; amount: number; method: string | null;
+  covers_from: string; covers_until: string; notes: string | null;
+}
+export interface AppPolicy { min_version: string | null; min_version_set_at: string | null; contact_text: string | null }
+
+export async function listLicenses(): Promise<License[]> {
+  const rows = check(await sb.from('licenses').select('business_id, cut_day, monthly_amount, paid_until, enforce, notes, updated_at'));
+  return rows.map((r) => ({ ...r, monthly_amount: n(r.monthly_amount) ?? 0 })) as License[];
+}
+
+export async function listPayments(businessId: string): Promise<LicensePayment[]> {
+  const rows = check(await sb.from('license_payments').select('id, business_id, paid_at, amount, method, covers_from, covers_until, notes')
+    .eq('business_id', businessId).order('paid_at', { ascending: false }).limit(50));
+  return rows.map((r) => ({ ...r, amount: n(r.amount) ?? 0 })) as LicensePayment[];
+}
+
+export async function getPolicy(): Promise<AppPolicy> {
+  const rows = check(await sb.from('app_policy').select('min_version, min_version_set_at, contact_text'));
+  return (rows[0] as AppPolicy) ?? { min_version: null, min_version_set_at: null, contact_text: null };
+}
+
+export async function licUpsert(businessId: string, cutDay: number, amount: number, paidUntil: string, notes: string | null) {
+  return check(await sb.rpc('lic_upsert', { p_business_id: businessId, p_cut_day: cutDay, p_monthly_amount: amount, p_paid_until: paidUntil, p_notes: notes }));
+}
+export async function licRegisterPayment(businessId: string, amount: number, method: string, notes: string | null): Promise<{ paid_until: string; covers_from: string }> {
+  return check(await sb.rpc('lic_register_payment', { p_business_id: businessId, p_amount: amount, p_method: method, p_notes: notes }));
+}
+export async function licSetEnforce(businessId: string, enforce: boolean) {
+  return check(await sb.rpc('lic_set_enforce', { p_business_id: businessId, p_enforce: enforce }));
+}
+export async function licUnlockCode(businessId: string): Promise<{ code: string; day: string; days: number }> {
+  return check(await sb.rpc('lic_unlock_code', { p_business_id: businessId }));
+}
+export async function licSetMinVersion(version: string | null) {
+  return check(await sb.rpc('lic_set_min_version', { p_version: version }));
+}
+export async function licSetContact(text: string | null) {
+  return check(await sb.rpc('lic_set_contact', { p_text: text }));
+}

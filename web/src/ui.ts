@@ -1,11 +1,11 @@
 import {
-  createIcons, Ban, Calculator, Check, ChevronRight, House, Info, LogIn, LogOut,
+  createIcons, Ban, Calculator, Check, ChevronRight, House, Info, KeyRound, LogIn, LogOut, Settings,
   MonitorSmartphone, Receipt, ShieldAlert, Store, TriangleAlert, X,
 } from 'lucide';
 
 // Solo los iconos que se usan (importar todos pesaba ~900 KB)
 const icons = {
-  Ban, Calculator, Check, ChevronRight, House, Info, LogIn, LogOut,
+  Ban, Calculator, Check, ChevronRight, House, Info, KeyRound, LogIn, LogOut, Settings,
   MonitorSmartphone, Receipt, ShieldAlert, Store, TriangleAlert, X,
 };
 

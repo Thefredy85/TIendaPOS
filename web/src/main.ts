@@ -7,6 +7,7 @@ import { renderInicio } from './views/inicio';
 import { renderVentas } from './views/ventas';
 import { renderCortes } from './views/cortes';
 import { renderCajas } from './views/cajas';
+import { renderLicencias } from './views/licencias';
 
 export interface Ctx {
   business: Business;
@@ -20,12 +21,15 @@ export interface Ctx {
 }
 export type View = (ctx: Ctx, el: HTMLElement) => Promise<void> | void;
 
-const ROUTES: Record<string, { title: string; icon: string; view: View }> = {
+const ROUTES: Record<string, { title: string; icon: string; view: View; superOnly?: boolean }> = {
   inicio: { title: 'Inicio', icon: 'house', view: renderInicio },
   ventas: { title: 'Ventas', icon: 'receipt', view: renderVentas },
   cortes: { title: 'Cortes', icon: 'calculator', view: renderCortes },
   cajas: { title: 'Cajas', icon: 'monitor-smartphone', view: renderCajas },
+  // solo el dueño del sistema; los gestores no la ven
+  licencias: { title: 'Licencias', icon: 'key-round', view: renderLicencias, superOnly: true },
 };
+const visible = (key: string) => !ROUTES[key].superOnly || ctx?.role === 'superadmin';
 
 const app = document.getElementById('app')!;
 const BIZ_KEY = 'panel.business';
@@ -39,7 +43,7 @@ let stopWatch: (() => void) | null = null;
 
 function route(): string {
   const r = location.hash.replace(/^#\/?/, '').split('/')[0];
-  return ROUTES[r] ? r : 'inicio';
+  return ROUTES[r] && visible(r) ? r : 'inicio';
 }
 
 async function boot() {
@@ -95,7 +99,7 @@ function bizLabel(b: Business): string {
 }
 
 function shell(current: string): string {
-  const nav = Object.entries(ROUTES).map(([key, r]) =>
+  const nav = Object.entries(ROUTES).filter(([key]) => visible(key)).map(([key, r]) =>
     `<a class="nav${key === current ? ' on' : ''}" href="#/${key}">${icon(r.icon)}<span>${r.title}</span>${key === 'cajas' ? '<span class="count" id="badge" hidden></span>' : ''}</a>`,
   ).join('');
   const options = businesses.map((b) =>
