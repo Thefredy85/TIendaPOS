@@ -222,6 +222,41 @@ fn list_items(conn: &Connection, store: &str) -> Vec<Value> {
         .collect()
 }
 
+// Registros con "timestamp" dentro de [from, to). Filtra en SQLite para no cargar
+// todo el historial (con meses de ventas, cargarlo todo hacia lenta la caja).
+// from/to vacios = sin limite por ese lado.
+fn list_items_between(conn: &Connection, store: &str, from: &str, to: &str) -> Vec<Value> {
+    // Se arma solo con los limites que vengan, para que SQLite use idx_store_data_fecha.
+    let mut sql = String::from("SELECT data FROM store_data WHERE store = ?1");
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&store];
+    if !from.is_empty() { sql.push_str(" AND json_extract(data, '$.timestamp') >= ?2"); args.push(&from); }
+    if !to.is_empty() { sql.push_str(if from.is_empty() { " AND json_extract(data, '$.timestamp') < ?2" } else { " AND json_extract(data, '$.timestamp') < ?3" }); args.push(&to); }
+    let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return vec![] };
+    let rows = match stmt.query_map(args.as_slice(), |row| row.get::<_, String>(0)) { Ok(r) => r, Err(_) => return vec![] };
+    rows.filter_map(|r| r.ok()).filter_map(|s| serde_json::from_str::<Value>(&s).ok()).collect()
+}
+
+// Varias escrituras como una sola: o quedan todas o ninguna (por ejemplo, si se va
+// la luz a mitad de una venta no queda inventario descontado sin su venta).
+// SAVEPOINT se puede anidar, asi que funciona aunque ya haya una transaccion abierta.
+fn all_or_nothing<F: FnOnce() -> Result<(), String>>(conn: &Connection, f: F) -> Result<(), String> {
+    conn.execute_batch("SAVEPOINT todo_o_nada").map_err(|e| e.to_string())?;
+    match f() {
+        Ok(()) => conn.execute_batch("RELEASE todo_o_nada").map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO todo_o_nada; RELEASE todo_o_nada");
+            Err(e)
+        }
+    }
+}
+
+// Codigo de barras normalizado para comparar: sin espacios ni simbolos y sin ceros a
+// la izquierda ("0750 100-0" y "7501000" son el mismo codigo).
+fn norm_code(code: &str) -> String {
+    let t: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
+    t.trim_start_matches('0').to_string()
+}
+
 fn get_item(conn: &Connection, store: &str, id: &str) -> Option<Value> {
     let raw: Result<String, _> = conn.query_row(
         "SELECT data FROM store_data WHERE store = ?1 AND id = ?2",
@@ -329,6 +364,12 @@ fn outbox_enqueue_all(conn: &Connection) -> Result<(), String> {
 // ---------- configuracion (settings) ----------
 
 fn normalize_settings(source: &Value) -> Value {
+    let mut out = normalize_base_settings(source);
+    add_print_settings(source, &mut out);
+    out
+}
+
+fn normalize_base_settings(source: &Value) -> Value {
     let g = |k: &str| source.get(k);
     let text_or = |k: &str, fallback: &str| {
         let s = clean_text(g(k));
@@ -401,6 +442,50 @@ fn normalize_settings(source: &Value) -> Value {
             json!({"Efectivo": efectivo, "Tarjeta": tarjeta, "Transferencia": transferencia})
         })
     })
+}
+
+// v0.2.13: impresión unificada para los 3 tickets (venta, Corte X y Corte Z).
+// Si la tienda nunca guardó estas opciones, se derivan de las que ya tenía
+// (58 mm -> 57 mm, compacto, casillas, títulos y pies): nada se pierde.
+fn add_print_settings(source: &Value, out: &mut Value) {
+    let g = |k: &str| source.get(k);
+    let flag = |k: &str, default: bool| match g(k) { Some(Value::Bool(b)) => *b, _ => default };
+    let text = |k: &str, default: String| { let t = clean_text(g(k)); if t.is_empty() { default } else { t.chars().take(300).collect() } };
+    let paper = { let v = clean_text(g("printPaperWidth")); if v == "57" || v == "80" { v } else if clean_text(g("ticketPaperWidth")) == "58" { "57".to_string() } else { "80".to_string() } };
+    out["printPaperWidth"] = json!(paper);
+    out["printCompact"] = json!(flag("printCompact", truthy_opt(g("ticketCompactMode"))));
+    let ff = clean_text(g("printFontFamily"));
+    out["printFontFamily"] = if ["Arial", "Courier New", "Tahoma", "Verdana"].contains(&ff.as_str()) { json!(ff) } else { out["ticketFontFamily"].clone() };
+    out["printFontSize"] = if g("printFontSize").is_some() { json!(clamp(num_of(g("printFontSize")), 8.0, 18.0)) } else { out["ticketFontSize"].clone() };
+    let ls = clean_text(g("printLineSpacing"));
+    out["printLineSpacing"] = if ["tight", "normal", "wide"].contains(&ls.as_str()) { json!(ls) } else { out["ticketLineSpacing"].clone() };
+    out["printBold"] = json!(flag("printBold", truthy_opt(g("ticketBold"))));
+    let compact = truthy_opt(g("ticketCompactMode"));
+    let sale_defaults = [
+        ("ShowLogo", truthy_opt(g("ticketShowLogo"))), ("ShowStore", not_false(g("ticketShowStore"))),
+        ("ShowTitle", !compact), ("ShowDate", not_false(g("ticketShowDate"))),
+        ("ShowCashier", not_false(g("ticketShowCashier"))), ("ShowPayments", not_false(g("ticketShowPayment"))),
+        ("ShowProducts", true), ("ShowBarcode", not_false(g("ticketShowSku"))),
+        ("ShowIva", not_false(g("ticketShowIva"))), ("ShowFooter", true),
+    ];
+    let cut_defaults = [
+        ("ShowLogo", truthy_opt(g("cashCutShowLogo"))), ("ShowStore", true), ("ShowTitle", true), ("ShowDate", true),
+        ("ShowCashier", true), ("ShowPayments", not_false(g("cashCutShowPayments"))),
+        ("ShowProducts", not_false(g("cashCutShowProducts"))), ("ShowBarcode", not_false(g("cashCutShowBarcode"))),
+        ("ShowIva", false), ("ShowFooter", true),
+    ];
+    for (k, d) in sale_defaults.iter() { let key = format!("sale{}", k); out[key.as_str()] = json!(flag(&key, *d)); }
+    for doc in ["cutX", "cutZ"] {
+        for (k, d) in cut_defaults.iter() { let key = format!("{}{}", doc, k); out[key.as_str()] = json!(flag(&key, *d)); }
+    }
+    let cut_title = clean_text(out.get("cashCutTitle"));
+    let cut_footer = clean_text(out.get("cashCutFooter"));
+    out["saleTitle"] = json!(text("saleTitle", clean_text(out.get("ticketTitle"))));
+    out["saleFooter"] = json!(text("saleFooter", clean_text(out.get("ticketFooter"))));
+    out["cutXTitle"] = json!(text("cutXTitle", format!("{} · Corte X", cut_title)));
+    out["cutZTitle"] = json!(text("cutZTitle", format!("{} · Corte Z", cut_title)));
+    out["cutXFooter"] = json!(text("cutXFooter", cut_footer.clone()));
+    out["cutZFooter"] = json!(text("cutZFooter", cut_footer));
 }
 
 fn default_settings() -> Value {
@@ -924,23 +1009,126 @@ fn op_data(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &s
     let manager = admin || role == "encargado";
     let perms = read_role_permissions(conn);
     let sees_ops = manager || has_permission(&perms, &role, "movements") || has_permission(&perms, &role, "counts");
+    // Al abrir solo se cargan los ultimos 45 dias (o desde que se abrio la caja, si el
+    // turno es mas largo). NADA se borra: lo anterior se consulta con op_history.
+    let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"periodStart": "", "openingAmount": 0.0, "isOpen": false}));
+    let mut since = (Utc::now() - chrono::Duration::days(HISTORY_DAYS_LOADED)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let period_start = clean_text(cash_state.get("periodStart"));
+    if !period_start.is_empty() && period_start < since { since = period_start; }
     let products = list_items(conn, "products");
-    let moves = if sees_ops { list_items(conn, "moves") } else { vec![] };
-    let counts = if sees_ops { list_items(conn, "counts") } else { vec![] };
-    let sales = list_items(conn, "sales");
+    let moves = if sees_ops { list_items_between(conn, "moves", &since, "") } else { vec![] };
+    let counts = if sees_ops { list_items_between(conn, "counts", &since, "") } else { vec![] };
+    let sales = list_items_between(conn, "sales", &since, "");
     let settings = read_settings(conn);
     let categories = list_items(conn, "categories");
     let units = list_items(conn, "units");
     let suppliers = list_items(conn, "suppliers");
     let presentations = list_items(conn, "presentations");
     let users: Vec<Value> = if admin { list_items(conn, "users").iter().map(public_user).collect() } else { vec![] };
-    let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"periodStart": "", "openingAmount": 0.0, "isOpen": false}));
-    let cash_cuts = list_items(conn, "cash_cuts");
+    let cash_cuts = list_items_between(conn, "cash_cuts", &since, "");
+    // mermas del mes (hora local de la PC), sin cargar todos los movimientos del mes
+    let month_start = {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+            .map(|dt| dt.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true))
+            .unwrap_or_default()
+    };
+    let waste_month: f64 = if sees_ops {
+        list_items_between(conn, "moves", &month_start, "").iter()
+            .filter(|m| clean_text(m.get("type")) == "merma")
+            .map(|m| num_of(m.get("totalCost")).abs()).sum()
+    } else { 0.0 };
     Ok(json!({
         "ok": true, "user": public_user(&user), "products": products, "moves": moves,
         "counts": counts, "sales": sales, "users": users, "settings": settings,
         "categories": categories, "units": units, "suppliers": suppliers, "presentations": presentations,
-        "cashState": cash_state, "cashCuts": cash_cuts, "rolePermissions": perms
+        "cashState": cash_state, "cashCuts": cash_cuts, "rolePermissions": perms,
+        "historyFrom": since,
+        "summary": {"wasteMonth": waste_month}
+    }))
+}
+
+// Al abrir: 8 dias (resumen de hoy, grafica de 7 dias). Las tablas de historial piden
+// su rango (30 dias por defecto, o cualquier fecha) solo cuando se abren.
+const HISTORY_DAYS_LOADED: i64 = 8;
+
+// Consulta del historial por fechas (todo lo guardado, sin limite de antiguedad).
+// from/to: instantes ISO (la pantalla los calcula con la hora local del dia elegido).
+fn op_history(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    let role = clean_text(user.get("role"));
+    let manager = role == "admin" || role == "encargado";
+    let perms = read_role_permissions(conn);
+    let sees_ops = manager || has_permission(&perms, &role, "movements") || has_permission(&perms, &role, "counts");
+    let kind = clean_text(payload.get("kind"));
+    let store = match kind.as_str() {
+        "sales" => "sales",
+        "cash_cuts" => "cash_cuts",
+        "moves" => "moves",
+        "counts" => "counts",
+        _ => return Err("Historial no reconocido".into()),
+    };
+    if (store == "moves" || store == "counts") && !sees_ops {
+        return Err("No autorizado".into());
+    }
+    let mut rows = list_items_between(conn, store, &clean_text(payload.get("from")), &clean_text(payload.get("to")));
+    rows.sort_by(|a, b| clean_text(b.get("timestamp")).cmp(&clean_text(a.get("timestamp"))));
+    Ok(json!({"ok": true, "kind": kind, "rows": rows}))
+}
+
+// Diagnostico de inventario (solo lectura): codigos duplicados, existencias negativas
+// o en cero, y ventas cuyo descuento no tiene su movimiento registrado.
+fn op_inventory_diagnostics(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    assert_role(&user, &["admin", "encargado"])?;
+    let products = list_items(conn, "products");
+    let brief = |p: &Value| json!({
+        "sku": clean_text(p.get("sku")), "name": clean_text(p.get("name")),
+        "barcode": clean_text(p.get("barcode")), "stock": num_of(p.get("stock")),
+        "active": not_false(p.get("active"))
+    });
+    let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
+    for p in &products {
+        let code = norm_code(&clean_text(p.get("barcode")));
+        if !code.is_empty() { groups.entry(code).or_default().push(brief(p)); }
+    }
+    let mut duplicates: Vec<Value> = groups.into_iter().filter(|(_, v)| v.len() > 1)
+        .map(|(k, v)| json!({"code": k, "products": v})).collect();
+    duplicates.sort_by(|a, b| clean_text(a.get("code")).cmp(&clean_text(b.get("code"))));
+    let negative: Vec<Value> = products.iter().filter(|p| num_of(p.get("stock")) < 0.0).map(|p| brief(p)).collect();
+    let zero: Vec<Value> = products.iter().filter(|p| num_of(p.get("stock")) == 0.0 && not_false(p.get("active"))).map(|p| brief(p)).collect();
+
+    let from = clean_text(payload.get("from"));
+    let to = clean_text(payload.get("to"));
+    let sales = list_items_between(conn, "sales", &from, &to);
+    let moves = list_items_between(conn, "moves", &from, "");
+    let mut has_move: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for m in &moves {
+        if clean_text(m.get("type")) == "venta" {
+            has_move.insert((clean_text(m.get("reference")), clean_text(m.get("sku"))));
+        }
+    }
+    let mut missing: Vec<Value> = vec![];
+    for sale in &sales {
+        let sid = clean_text(sale.get("id"));
+        let lines: Vec<Value> = serde_json::from_str(&clean_text(sale.get("itemsJson"))).unwrap_or_default();
+        for line in &lines {
+            let sku = clean_text(line.get("sku"));
+            if !sku.is_empty() && !has_move.contains(&(sid.clone(), sku.clone())) {
+                missing.push(json!({
+                    "saleId": sid, "timestamp": clean_text(sale.get("timestamp")), "sku": sku,
+                    "name": clean_text(line.get("name")), "qty": num_of(line.get("qty")),
+                    "cancelled": truthy_opt(sale.get("cancelled"))
+                }));
+            }
+        }
+    }
+    Ok(json!({
+        "ok": true, "duplicates": duplicates, "negative": negative, "zero": zero,
+        "missingMoves": missing, "checkedSales": sales.len(), "from": from, "to": to
     }))
 }
 
@@ -989,7 +1177,7 @@ fn op_cash_cut(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     let period_start = clean_text(cash_state.get("periodStart"));
     let opening = num_of(cash_state.get("openingAmount"));
     let now = now_iso();
-    let sales = list_items(conn, "sales");
+    let sales = list_items_between(conn, "sales", &period_start, "");
     let period_sales: Vec<&Value> = sales
         .iter()
         .filter(|s| (period_start.is_empty() || clean_text(s.get("timestamp")) >= period_start) && !truthy_opt(s.get("cancelled")))
@@ -1187,7 +1375,8 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
         return Err("El codigo de barras es obligatorio. Escanealo o escribelo para guardar el producto.".into());
     }
     if !barcode.is_empty() {
-        if let Some(dup) = products.iter().find(|p| clean_text(p.get("sku")) != sku && clean_text(p.get("barcode")) == barcode) {
+        let wanted = norm_code(&barcode);
+        if let Some(dup) = products.iter().find(|p| clean_text(p.get("sku")) != sku && !wanted.is_empty() && norm_code(&clean_text(p.get("barcode"))) == wanted) {
             return Err(format!("Ese código de barras ya está asignado a \"{}\" ({}). Cada producto necesita un código único para que el escaneo no descuente el producto equivocado.", clean_text(dup.get("name")), clean_text(dup.get("sku"))));
         }
     }
@@ -1366,13 +1555,25 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     if !cash_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err("Debes abrir la caja antes de la primera venta. Indica el fondo inicial para comenzar.".into());
     }
-    let items = payload.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // Une las lineas del mismo producto: si llegaran dos, se descuentan las dos.
+    let raw_items = payload.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut items: Vec<Value> = vec![];
+    for line in &raw_items {
+        let sku = clean_text(line.get("sku"));
+        let qty = num_of(line.get("qty"));
+        if sku.is_empty() || qty <= 0.0 { return Err("Cantidad invalida".into()); }
+        if let Some(prev) = items.iter_mut().find(|l| clean_text(l.get("sku")) == sku) {
+            let total_qty = num_of(prev.get("qty")) + qty;
+            prev["qty"] = json!(total_qty);
+        } else {
+            items.push(line.clone());
+        }
+    }
     if items.is_empty() { return Err("Ticket vacio".into()); }
-    let products = list_items(conn, "products");
     let requested_id = { let a = clean_text(payload.get("clientId")); if !a.is_empty() { a } else { clean_text(payload.get("id")) } };
-    let id = if !requested_id.is_empty() { requested_id } else { format!("SALE-{}", now_millis()) };
-    let existing_sales = list_items(conn, "sales");
-    if let Some(existing) = existing_sales.iter().find(|s| clean_text(s.get("id")) == id) {
+    let id = if !requested_id.is_empty() { requested_id } else { format!("SALE-{}-{}", now_millis(), next_seq()) };
+    // reintento con el mismo folio: no se vuelve a descontar
+    if let Some(existing) = get_item(conn, "sales", &id) {
         return Ok(json!({"ok": true, "sale": existing, "duplicate": true}));
     }
     let timestamp = now_iso();
@@ -1380,12 +1581,8 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     let mut profit = 0.0;
     for line in &items {
         let sku = clean_text(line.get("sku"));
-        let product = products.iter().find(|p| clean_text(p.get("sku")) == sku)
-            .ok_or_else(|| format!("Producto no encontrado: {}", sku))?;
+        let product = get_item(conn, "products", &sku).ok_or_else(|| format!("Producto no encontrado: {}", sku))?;
         let qty = num_of(line.get("qty"));
-        if qty <= 0.0 { return Err("Cantidad invalida".into()); }
-        let stock = num_of(product.get("stock"));
-        if stock < qty { return Err(format!("Stock insuficiente: {}", clean_text(product.get("name")))); }
         let price = num_of(product.get("price"));
         let cost = num_of(product.get("cost"));
         subtotal += price * qty;
@@ -1406,7 +1603,6 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     if payment_breakdown.is_empty() {
         let pm = { let p = clean_text(payload.get("paymentMethod")); if p.is_empty() { "Efectivo".to_string() } else { p } };
         payment_breakdown.insert(pm, json!(total));
-        payments_sum = total;
     } else if (payments_sum - total).abs() > 0.01 {
         return Err(format!("El pago (${:.2}) no coincide con el total (${:.2})", payments_sum, total));
     }
@@ -1415,24 +1611,6 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     } else {
         payment_breakdown.keys().next().cloned().unwrap_or_else(|| "Efectivo".to_string())
     };
-    for line in &items {
-        let sku = clean_text(line.get("sku"));
-        let product = products.iter().find(|p| clean_text(p.get("sku")) == sku).unwrap();
-        let qty = num_of(line.get("qty"));
-        let before = num_of(product.get("stock"));
-        let after = before - qty;
-        patch_item(conn, "products", &sku, &json!({"stock": after}))?;
-        let mov_id = format!("MOV-{}-{}-{}", now_millis(), next_seq(), sku);
-        let cost = num_of(product.get("cost"));
-        let mov = json!({
-            "id": mov_id, "timestamp": timestamp, "type": "venta", "sku": sku,
-            "productName": clean_text(product.get("name")),
-            "quantity": -qty, "stockBefore": before, "stockAfter": after,
-            "unitCost": cost, "totalCost": -cost * qty,
-            "reason": "Venta POS", "reference": id, "user": display_or_username(&user), "notes": ""
-        });
-        create_item(conn, "moves", &mov_id, &mov)?;
-    }
     let items_json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
     let sale = json!({
         "id": id, "timestamp": timestamp, "itemsJson": items_json, "subtotal": subtotal,
@@ -1440,8 +1618,35 @@ fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token
         "paymentBreakdown": Value::Object(payment_breakdown),
         "user": display_or_username(&user), "notes": "", "profit": profit
     });
-    create_item(conn, "sales", &id, &sale)?;
-    Ok(json!({"ok": true, "sale": sale}))
+    // Descuento: con la existencia del momento de cada producto. Si no alcanza, se
+    // vende igual y queda en negativo (asi ninguna venta se escapa del inventario);
+    // se avisa para corregirlo con un conteo. Todo se guarda junto o nada.
+    let mut negative: Vec<Value> = vec![];
+    all_or_nothing(conn, || {
+        for line in &items {
+            let sku = clean_text(line.get("sku"));
+            let product = get_item(conn, "products", &sku).ok_or_else(|| format!("Producto no encontrado: {}", sku))?;
+            let qty = num_of(line.get("qty"));
+            let before = num_of(product.get("stock"));
+            let after = before - qty;
+            patch_item(conn, "products", &sku, &json!({"stock": after}))?;
+            if after < 0.0 {
+                negative.push(json!({"sku": sku, "name": clean_text(product.get("name")), "stock": after}));
+            }
+            let mov_id = format!("MOV-{}-{}-{}", now_millis(), next_seq(), sku);
+            let cost = num_of(product.get("cost"));
+            let mov = json!({
+                "id": mov_id, "timestamp": timestamp, "type": "venta", "sku": sku,
+                "productName": clean_text(product.get("name")),
+                "quantity": -qty, "stockBefore": before, "stockAfter": after,
+                "unitCost": cost, "totalCost": -cost * qty,
+                "reason": "Venta POS", "reference": id, "user": display_or_username(&user), "notes": ""
+            });
+            create_item(conn, "moves", &mov_id, &mov)?;
+        }
+        create_item(conn, "sales", &id, &sale)
+    })?;
+    Ok(json!({"ok": true, "sale": sale, "negativeStock": negative}))
 }
 
 fn op_cancel_sale(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
@@ -1467,41 +1672,44 @@ fn op_cancel_sale(conn: &Connection, sessions: &mut HashMap<String, Session>, to
     if items.is_empty() {
         return Err("Esta venta no tiene productos que revertir".into());
     }
-    let products = list_items(conn, "products");
     let mut restored: Vec<Value> = vec![];
     let mut skipped: Vec<String> = vec![];
     let timestamp = now_iso();
-    for line in &items {
-        let sku = clean_text(line.get("sku"));
-        let qty = num_of(line.get("qty"));
-        if let Some(product) = products.iter().find(|p| clean_text(p.get("sku")) == sku) {
-            let before = num_of(product.get("stock"));
-            let after = before + qty;
-            patch_item(conn, "products", &sku, &json!({"stock": after}))?;
-            let mov_id = format!("MOV-DEV-{}-{}-{}", now_millis(), next_seq(), sku);
-            let cost = num_of(product.get("cost"));
-            let mov = json!({
-                "id": mov_id, "timestamp": timestamp, "type": "devolucion_venta", "sku": sku,
-                "productName": clean_text(line.get("name")),
-                "quantity": qty, "stockBefore": before, "stockAfter": after,
-                "unitCost": cost, "totalCost": cost * qty,
-                "reason": format!("Cancelacion de venta {}", id), "reference": id,
-                "user": display_or_username(&user), "authorizedBy": display_or_username(&admin_user), "notes": ""
-            });
-            create_item(conn, "moves", &mov_id, &mov)?;
-            restored.push(json!({"sku": sku, "qty": qty}));
-        } else {
-            // el producto ya no existe en el catalogo (fue eliminado despues de la venta):
-            // no hay a donde devolver la existencia, se deja constancia y se continua.
-            skipped.push(sku);
+    // devolver inventario y marcar la venta cancelada: todo junto o nada
+    all_or_nothing(conn, || {
+        for line in &items {
+            let sku = clean_text(line.get("sku"));
+            let qty = num_of(line.get("qty"));
+            if let Some(product) = get_item(conn, "products", &sku) {
+                let before = num_of(product.get("stock"));
+                let after = before + qty;
+                patch_item(conn, "products", &sku, &json!({"stock": after}))?;
+                let mov_id = format!("MOV-DEV-{}-{}-{}", now_millis(), next_seq(), sku);
+                let cost = num_of(product.get("cost"));
+                let mov = json!({
+                    "id": mov_id, "timestamp": timestamp, "type": "devolucion_venta", "sku": sku,
+                    "productName": clean_text(line.get("name")),
+                    "quantity": qty, "stockBefore": before, "stockAfter": after,
+                    "unitCost": cost, "totalCost": cost * qty,
+                    "reason": format!("Cancelacion de venta {}", id), "reference": id,
+                    "user": display_or_username(&user), "authorizedBy": display_or_username(&admin_user), "notes": ""
+                });
+                create_item(conn, "moves", &mov_id, &mov)?;
+                restored.push(json!({"sku": sku, "qty": qty}));
+            } else {
+                // el producto ya no existe en el catalogo (fue eliminado despues de la venta):
+                // no hay a donde devolver la existencia, se deja constancia y se continua.
+                skipped.push(sku);
+            }
         }
-    }
-    patch_item(conn, "sales", &id, &json!({
-        "cancelled": true,
-        "cancelledAt": timestamp,
-        "cancelledBy": display_or_username(&user),
-        "cancelledAuthorizedBy": display_or_username(&admin_user)
-    }))?;
+        patch_item(conn, "sales", &id, &json!({
+            "cancelled": true,
+            "cancelledAt": timestamp,
+            "cancelledBy": display_or_username(&user),
+            "cancelledAuthorizedBy": display_or_username(&admin_user)
+        }))?;
+        Ok(())
+    })?;
     Ok(json!({"ok": true, "restored": restored, "skippedSkus": skipped}))
 }
 
@@ -1546,6 +1754,8 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "checkout" => op_checkout(conn, sessions, token, payload),
         "cancel_sale" => op_cancel_sale(conn, sessions, token, payload),
         "sync_batch" => op_sync_batch(conn, sessions, token, payload),
+        "history" => op_history(conn, sessions, token, payload),
+        "inventory_diagnostics" => op_inventory_diagnostics(conn, sessions, token, payload),
         "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
         "cash_cut" => op_cash_cut(conn, sessions, token, payload),
         _ => Ok(json!({"ok": false, "error": "Operacion no reconocida"})),
@@ -1597,6 +1807,13 @@ fn init_db(conn: &Connection) {
         [],
     )
     .expect("no se pudo crear la tabla outbox");
+    // v0.2.13: indice por fecha para leer historial por rango sin revisar todas las filas.
+    // Solo se agrega; no cambia ningun dato. La expresion debe ser IGUAL a la de list_items_between.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_store_data_fecha ON store_data (store, json_extract(data, '$.timestamp'))",
+        [],
+    )
+    .ok();
 }
 
 // ---------- nube (Supabase): registro de la caja, envio y latido ----------
@@ -2144,6 +2361,23 @@ mod tests {
     #[test]
     fn la_personalizacion_conserva_todas_sus_opciones() {
         let n = normalize_settings(&json!({"ticketPaperWidth":"58","ticketCompactMode":true,"ticketLineSpacing":"tight","cashCutLineSpacing":"wide","cashCutShowUnit":true,"cashCutShowSupplier":true,"cashCutShowBarcode":false}));
+        // v0.2.13: las opciones viejas pasan a la impresion unificada sin perderse
+        assert_eq!(n["printPaperWidth"], "57");
+        assert_eq!(n["printCompact"], true);
+        assert_eq!(n["printLineSpacing"], "tight");
+        assert_eq!(n["saleShowTitle"], false, "en modo compacto el ticket no llevaba titulo");
+        assert_eq!(n["cutXShowBarcode"], false);
+        assert_eq!(n["cutZShowProducts"], true);
+        assert_eq!(n["saleTitle"], "Ticket de venta");
+        assert_eq!(n["cutZTitle"], "Corte de caja · Corte Z");
+        // y lo que se guarda desde la pestaña nueva se respeta
+        let m = normalize_settings(&json!({"printPaperWidth":"80","printCompact":false,"saleShowIva":false,"cutXShowIva":true,"cutZFooter":"Firma del encargado","printFontSize":9}));
+        assert_eq!(m["printPaperWidth"], "80");
+        assert_eq!(m["printCompact"], false);
+        assert_eq!(m["saleShowIva"], false);
+        assert_eq!(m["cutXShowIva"], true);
+        assert_eq!(m["cutZFooter"], "Firma del encargado");
+        assert_eq!(m["printFontSize"], 9.0);
         assert_eq!(n["ticketPaperWidth"], "58");
         assert_eq!(n["ticketCompactMode"], true);
         assert_eq!(n["ticketLineSpacing"], "tight");
@@ -2250,6 +2484,84 @@ mod tests {
         assert_eq!(stock_of(&conn, "BEB-0001"), 5.0);
     }
 
+    // ---------- metodo de descuento (prioridad del dueño) ----------
+
+    #[test]
+    fn el_cobro_descuenta_exacto_aunque_lleguen_lineas_repetidas_o_sin_existencia() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 10.0, 10.0);
+        put(&conn, "BOT-0001", "222", "Papas", 20.0, 1.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        // dos lineas del mismo producto: se descuentan las dos (antes solo una)
+        let r = dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":1},{"sku":"BEB-0001","qty":2}],"payments":{"Efectivo":30.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 7.0);
+        assert_eq!(r["sale"]["total"], 30.0);
+        let moves: Vec<Value> = list_items(&conn, "moves").into_iter().filter(|m| clean_text(m.get("reference")) == "S1").collect();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0]["quantity"], -3.0);
+        // sin existencia suficiente: se vende igual, queda en negativo y se avisa
+        let r2 = dispatch("checkout", &json!({"clientId":"S2","items":[{"sku":"BOT-0001","qty":3}],"payments":{"Efectivo":60.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BOT-0001"), -2.0);
+        assert_eq!(r2["negativeStock"][0]["sku"], "BOT-0001");
+        // un pago que no cuadra no toca nada
+        assert!(dispatch("checkout", &json!({"clientId":"S3","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":1.0}}), &t, &conn, &mut s).is_err());
+        assert_eq!(stock_of(&conn, "BEB-0001"), 7.0);
+        assert!(get_item(&conn, "sales", "S3").is_none());
+        // un producto que no existe no deja nada a medias
+        assert!(dispatch("checkout", &json!({"clientId":"S4","items":[{"sku":"BEB-0001","qty":1},{"sku":"NO-EXISTE","qty":1}],"payments":{"Efectivo":10.0}}), &t, &conn, &mut s).is_err());
+        assert_eq!(stock_of(&conn, "BEB-0001"), 7.0);
+        assert!(get_item(&conn, "sales", "S4").is_none());
+        // cancelar devuelve exacto
+        dispatch("cancel_sale", &json!({"id":"S1"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+    }
+
+    #[test]
+    fn al_abrir_carga_pocos_dias_y_el_historial_encuentra_lo_anterior() {
+        let (conn, mut s, t) = fresh();
+        let old = (Utc::now() - chrono::Duration::days(60)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let recent = (Utc::now() - chrono::Duration::days(3)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        for (id, ts) in [("S-VIEJA", &old), ("S-RECIENTE", &recent)] {
+            create_item(&conn, "sales", id, &json!({"id": id, "timestamp": ts, "itemsJson": "[]", "total": 5, "paymentMethod": "Efectivo"})).unwrap();
+            create_item(&conn, "moves", &format!("M-{}", id), &json!({"id": format!("M-{}", id), "timestamp": ts, "type": "entrada_compra", "sku": "X", "quantity": 1})).unwrap();
+        }
+        let d = dispatch("data", &json!({}), &t, &conn, &mut s).unwrap();
+        let ids: Vec<String> = d["sales"].as_array().unwrap().iter().map(|x| clean_text(x.get("id"))).collect();
+        assert_eq!(ids, vec!["S-RECIENTE".to_string()]);
+        assert_eq!(d["moves"].as_array().unwrap().len(), 1);
+        // nada se borro: el historial por fechas encuentra la venta de hace 60 dias
+        let from = (Utc::now() - chrono::Duration::days(90)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let h = dispatch("history", &json!({"kind":"sales","from":from,"to":""}), &t, &conn, &mut s).unwrap();
+        assert_eq!(h["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(h["rows"][0]["id"], "S-RECIENTE");
+        let hm = dispatch("history", &json!({"kind":"moves","from":from,"to":recent}), &t, &conn, &mut s).unwrap();
+        assert_eq!(hm["rows"].as_array().unwrap().len(), 1);
+        assert!(get_item(&conn, "sales", "S-VIEJA").is_some());
+    }
+
+    #[test]
+    fn el_diagnostico_encuentra_duplicados_negativos_y_ventas_sin_descuento() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "A", "0750100", "Galleta A", 10.0, 3.0);
+        put(&conn, "B", "750100", "Galleta B", 10.0, -2.0);
+        put(&conn, "C", "333", "Jugo", 10.0, 5.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S-BIEN","items":[{"sku":"C","qty":1}],"payments":{"Efectivo":10.0}}), &t, &conn, &mut s).unwrap();
+        // una venta guardada sin su movimiento (como las que "no se descontaron")
+        create_item(&conn, "sales", "S-MAL", &json!({"id":"S-MAL","timestamp":now_iso(),"itemsJson":"[{\"sku\":\"C\",\"qty\":2,\"name\":\"Jugo\"}]","total":20})).unwrap();
+        let before = snapshot(&conn);
+        let d = dispatch("inventory_diagnostics", &json!({}), &t, &conn, &mut s).unwrap();
+        assert_eq!(d["duplicates"].as_array().unwrap().len(), 1, "0750100 y 750100 son el mismo codigo");
+        assert_eq!(d["negative"][0]["sku"], "B");
+        let missing = d["missingMoves"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["saleId"], "S-MAL");
+        // el diagnostico no corrige nada solo
+        assert_eq!(before, snapshot(&conn));
+        // y un alta con un codigo que solo difiere en ceros se rechaza
+        assert!(dispatch("save_product", &json!({"mode":"new","record":{"barcode":"00333","name":"Otro","category":"Bebidas","price":1,"cost":1}}), &t, &conn, &mut s).is_err());
+    }
+
     #[test]
     fn cancelar_dos_veces_no_devuelve_inventario_doble() {
         let (conn, mut s, t) = fresh();
@@ -2328,7 +2640,10 @@ mod tests {
         let t = login_as(&conn, &mut s, "1234", "1234");
         let data = dispatch("data", &json!({}), &t, &conn, &mut s).unwrap();
         assert_eq!(data["products"].as_array().unwrap().len(), 3);
-        assert_eq!(data["sales"].as_array().unwrap().len(), 1);
+        // la venta vieja (enero) no se carga al abrir, pero sigue guardada y el historial la encuentra
+        assert_eq!(data["sales"].as_array().unwrap().len(), 0);
+        let h = dispatch("history", &json!({"kind":"sales","from":"2026-01-01T00:00:00.000Z","to":""}), &t, &conn, &mut s).unwrap();
+        assert_eq!(h["rows"].as_array().unwrap().len(), 1);
         assert_eq!(read_settings(&conn)["storeTitle"], "Abarrotes Viejo");
 
         // cobrar un producto viejo y uno SIN codigo de barras
@@ -2561,6 +2876,31 @@ mod tests {
                 "__test_put_product" => {
                     let sku = clean_text(payload.get("sku"));
                     create_item(&conn, "products", &sku, &payload).unwrap();
+                    json!({"ok": true})
+                }
+                // registro con cualquier forma y fecha (p. ej. una venta de hace 60 dias)
+                "__test_put_item" => {
+                    let store = clean_text(payload.get("store"));
+                    let id = clean_text(payload.get("id"));
+                    create_item(&conn, &store, &id, payload.get("data").unwrap_or(&json!({}))).unwrap();
+                    json!({"ok": true})
+                }
+                // carga rapida de N ventas (con sus 2 movimientos) repartidas en los ultimos 60 dias,
+                // para la prueba de volumen. No pasa por el cobro: solo llena el historial.
+                "__test_bulk_sales" => {
+                    let n = num_of(payload.get("n")) as i64;
+                    conn.execute_batch("BEGIN").unwrap();
+                    for i in 0..n {
+                        let ts = (Utc::now() - chrono::Duration::minutes((n - i) * 60 * 24 * 60 / n.max(1))).to_rfc3339_opts(SecondsFormat::Millis, true);
+                        let id = format!("BULK-{}", i);
+                        let items = json!([{"sku":"GRA-0001","qty":1,"name":"Granel","price":9.0,"cost":4.5},{"sku":"GRA-0001","qty":1,"name":"Granel","price":9.0,"cost":4.5}]).to_string();
+                        create_item(&conn, "sales", &id, &json!({"id":id,"timestamp":ts,"itemsJson":items,"subtotal":18.0,"discount":0,"total":18.0,"paymentMethod":"Efectivo","paymentBreakdown":{"Efectivo":18.0},"user":"Admin","notes":"","profit":9.0})).unwrap();
+                        for k in 0..2 {
+                            let mid = format!("MOV-BULK-{}-{}", i, k);
+                            create_item(&conn, "moves", &mid, &json!({"id":mid,"timestamp":ts,"type":"venta","sku":"GRA-0001","productName":"Granel","quantity":-1,"stockBefore":0,"stockAfter":0,"unitCost":4.5,"totalCost":-4.5,"reason":"Venta POS","reference":id,"user":"Admin","notes":""})).unwrap();
+                        }
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
                     json!({"ok": true})
                 }
                 "__test_get_product" => {

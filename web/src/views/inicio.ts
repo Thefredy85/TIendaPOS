@@ -32,7 +32,7 @@ export async function renderInicio(ctx: Ctx, el: HTMLElement) {
           <div class="grow"><div><b>${esc(deviceName(d))}</b> <span class="pill ${st.cls}">${st.label}</span></div>
           <div class="small muted">${cashLine(d)}</div></div>${approve}</li>`;
       }).join('')}</ul>`
-        : '<div class="card empty small">Sin cajas conectadas todavía. Aparecen al instalar la v0.2.13 en la tienda.</div>'}
+        : '<div class="card empty small">Sin cajas conectadas todavía. Aparecen al instalar la v0.2.14 en la tienda.</div>'}
       <div class="section-title">${icon('receipt')} Últimas ventas</div>
       ${sales.length ? `<ul class="list card">${sales.slice(0, 8).map(saleRow).join('')}</ul>
         ${sales.length > 8 ? '<p class="small"><a href="#/ventas">Ver todas las ventas de hoy</a></p>' : ''}`
