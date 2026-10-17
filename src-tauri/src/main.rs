@@ -298,6 +298,12 @@ fn delete_item(conn: &Connection, store: &str, id: &str) -> Result<(), String> {
 // ---------- configuracion (settings) ----------
 
 fn normalize_settings(source: &Value) -> Value {
+    let mut out = normalize_base_settings(source);
+    add_print_settings(source, &mut out);
+    out
+}
+
+fn normalize_base_settings(source: &Value) -> Value {
     let g = |k: &str| source.get(k);
     let text_or = |k: &str, fallback: &str| {
         let s = clean_text(g(k));
@@ -370,6 +376,50 @@ fn normalize_settings(source: &Value) -> Value {
             json!({"Efectivo": efectivo, "Tarjeta": tarjeta, "Transferencia": transferencia})
         })
     })
+}
+
+// v0.2.13: impresión unificada para los 3 tickets (venta, Corte X y Corte Z).
+// Si la tienda nunca guardó estas opciones, se derivan de las que ya tenía
+// (58 mm -> 57 mm, compacto, casillas, títulos y pies): nada se pierde.
+fn add_print_settings(source: &Value, out: &mut Value) {
+    let g = |k: &str| source.get(k);
+    let flag = |k: &str, default: bool| match g(k) { Some(Value::Bool(b)) => *b, _ => default };
+    let text = |k: &str, default: String| { let t = clean_text(g(k)); if t.is_empty() { default } else { t.chars().take(300).collect() } };
+    let paper = { let v = clean_text(g("printPaperWidth")); if v == "57" || v == "80" { v } else if clean_text(g("ticketPaperWidth")) == "58" { "57".to_string() } else { "80".to_string() } };
+    out["printPaperWidth"] = json!(paper);
+    out["printCompact"] = json!(flag("printCompact", truthy_opt(g("ticketCompactMode"))));
+    let ff = clean_text(g("printFontFamily"));
+    out["printFontFamily"] = if ["Arial", "Courier New", "Tahoma", "Verdana"].contains(&ff.as_str()) { json!(ff) } else { out["ticketFontFamily"].clone() };
+    out["printFontSize"] = if g("printFontSize").is_some() { json!(clamp(num_of(g("printFontSize")), 8.0, 18.0)) } else { out["ticketFontSize"].clone() };
+    let ls = clean_text(g("printLineSpacing"));
+    out["printLineSpacing"] = if ["tight", "normal", "wide"].contains(&ls.as_str()) { json!(ls) } else { out["ticketLineSpacing"].clone() };
+    out["printBold"] = json!(flag("printBold", truthy_opt(g("ticketBold"))));
+    let compact = truthy_opt(g("ticketCompactMode"));
+    let sale_defaults = [
+        ("ShowLogo", truthy_opt(g("ticketShowLogo"))), ("ShowStore", not_false(g("ticketShowStore"))),
+        ("ShowTitle", !compact), ("ShowDate", not_false(g("ticketShowDate"))),
+        ("ShowCashier", not_false(g("ticketShowCashier"))), ("ShowPayments", not_false(g("ticketShowPayment"))),
+        ("ShowProducts", true), ("ShowBarcode", not_false(g("ticketShowSku"))),
+        ("ShowIva", not_false(g("ticketShowIva"))), ("ShowFooter", true),
+    ];
+    let cut_defaults = [
+        ("ShowLogo", truthy_opt(g("cashCutShowLogo"))), ("ShowStore", true), ("ShowTitle", true), ("ShowDate", true),
+        ("ShowCashier", true), ("ShowPayments", not_false(g("cashCutShowPayments"))),
+        ("ShowProducts", not_false(g("cashCutShowProducts"))), ("ShowBarcode", not_false(g("cashCutShowBarcode"))),
+        ("ShowIva", false), ("ShowFooter", true),
+    ];
+    for (k, d) in sale_defaults.iter() { let key = format!("sale{}", k); out[key.as_str()] = json!(flag(&key, *d)); }
+    for doc in ["cutX", "cutZ"] {
+        for (k, d) in cut_defaults.iter() { let key = format!("{}{}", doc, k); out[key.as_str()] = json!(flag(&key, *d)); }
+    }
+    let cut_title = clean_text(out.get("cashCutTitle"));
+    let cut_footer = clean_text(out.get("cashCutFooter"));
+    out["saleTitle"] = json!(text("saleTitle", clean_text(out.get("ticketTitle"))));
+    out["saleFooter"] = json!(text("saleFooter", clean_text(out.get("ticketFooter"))));
+    out["cutXTitle"] = json!(text("cutXTitle", format!("{} · Corte X", cut_title)));
+    out["cutZTitle"] = json!(text("cutZTitle", format!("{} · Corte Z", cut_title)));
+    out["cutXFooter"] = json!(text("cutXFooter", cut_footer.clone()));
+    out["cutZFooter"] = json!(text("cutZFooter", cut_footer));
 }
 
 fn default_settings() -> Value {
@@ -1975,6 +2025,23 @@ mod tests {
     #[test]
     fn la_personalizacion_conserva_todas_sus_opciones() {
         let n = normalize_settings(&json!({"ticketPaperWidth":"58","ticketCompactMode":true,"ticketLineSpacing":"tight","cashCutLineSpacing":"wide","cashCutShowUnit":true,"cashCutShowSupplier":true,"cashCutShowBarcode":false}));
+        // v0.2.13: las opciones viejas pasan a la impresion unificada sin perderse
+        assert_eq!(n["printPaperWidth"], "57");
+        assert_eq!(n["printCompact"], true);
+        assert_eq!(n["printLineSpacing"], "tight");
+        assert_eq!(n["saleShowTitle"], false, "en modo compacto el ticket no llevaba titulo");
+        assert_eq!(n["cutXShowBarcode"], false);
+        assert_eq!(n["cutZShowProducts"], true);
+        assert_eq!(n["saleTitle"], "Ticket de venta");
+        assert_eq!(n["cutZTitle"], "Corte de caja · Corte Z");
+        // y lo que se guarda desde la pestaña nueva se respeta
+        let m = normalize_settings(&json!({"printPaperWidth":"80","printCompact":false,"saleShowIva":false,"cutXShowIva":true,"cutZFooter":"Firma del encargado","printFontSize":9}));
+        assert_eq!(m["printPaperWidth"], "80");
+        assert_eq!(m["printCompact"], false);
+        assert_eq!(m["saleShowIva"], false);
+        assert_eq!(m["cutXShowIva"], true);
+        assert_eq!(m["cutZFooter"], "Firma del encargado");
+        assert_eq!(m["printFontSize"], 9.0);
         assert_eq!(n["ticketPaperWidth"], "58");
         assert_eq!(n["ticketCompactMode"], true);
         assert_eq!(n["ticketLineSpacing"], "tight");

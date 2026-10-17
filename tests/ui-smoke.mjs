@@ -466,6 +466,43 @@ async function main() {
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
 
+    console.log('\n11) Tickets: venta, Corte X y Corte Z con el mismo formato y las mismas opciones (57 mm)');
+    await seed();
+    await call('__test_put_item', { store: 'cash_cuts', id: 'CORTEZ-VIEJO', data: { id: 'CORTEZ-VIEJO', type: 'z', timestamp: daysAgo(3), periodStart: daysAgo(3.5), periodEnd: daysAgo(3), openingAmount: 300, total: 0, salesCount: 0, payments: {}, user: 'Luis Viejo' } });
+    ({ page, errors, context } = await newPage(browser));
+    await login(page);
+    await openCash(page);
+    await page.evaluate(() => show('personalization'));
+    await page.click('[data-design-tab="print"]');
+    await page.waitForTimeout(300);
+    const flagsPerDoc = await page.evaluate(() => ['sale', 'cutX', 'cutZ'].map((d) => PRINT_FLAGS.filter(([k]) => document.getElementById(`print_${d}${k}`)).length));
+    check(JSON.stringify(flagsPerDoc) === JSON.stringify([10, 10, 10]), '11) los tres tickets tienen las mismas 10 opciones', JSON.stringify(flagsPerDoc));
+    await page.selectOption('#print_printPaperWidth', '57');
+    await page.check('#print_printCompact');
+    await page.check('#print_cutZShowIva');
+    await page.dispatchEvent('#print_cutZShowIva', 'change');
+    const shots = process.env.TICKET_SHOTS;
+    for (const d of ['sale', 'cutX', 'cutZ']) {
+      await page.click(`[data-print-preview="${d}"]`);
+      await page.waitForTimeout(200);
+      const txt = await page.locator('#printPreview').innerText();
+      check(txt.length > 20, `11) vista previa de ${d} se genera`);
+      if (d === 'cutZ') check(/IVA/.test(txt), '11) una opción marcada solo para el Corte Z aparece en el Corte Z');
+      if (d === 'cutX') check(!/IVA/.test(txt), '11) y no aparece en el Corte X');
+      if (shots) await page.locator('#printPreview').screenshot({ path: `${shots}/ticket-${d}.png` }).catch(() => {});
+    }
+    await page.evaluate(() => document.getElementById('designForm').requestSubmit());
+    await page.waitForTimeout(1200);
+    const saved11 = (await dataNow()).settings || {};
+    check(saved11.printPaperWidth === '57' && saved11.printCompact === true && saved11.cutZShowIva === true && saved11.cutXShowIva === false, '11) las opciones se guardan', JSON.stringify({ p: saved11.printPaperWidth, c: saved11.printCompact, z: saved11.cutZShowIva, x: saved11.cutXShowIva }));
+    await page.evaluate(() => viewCashCut('CORTEZ-VIEJO'));
+    await page.waitForSelector('#viewCutDialog[open]', { timeout: 5000 }).catch(() => {});
+    const cutTxt = await page.locator('#viewCutBody').innerText().catch(() => '');
+    check(/Luis Viejo/.test(cutTxt), '11) un corte viejo se muestra con SU usuario (no el de hoy)', cutTxt.slice(0, 120));
+    check(/Fondo inicial/.test(cutTxt) && /Efectivo esperado/.test(cutTxt), '11) el corte muestra fondo inicial y efectivo esperado');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
     // Falla encontrada: con ~2 meses de historial la copia del navegador llenaba su límite y la app dejaba de abrir.
     console.log('\n10) Volumen: 7,000 ventas (~2 meses) y una copia vieja casi llena en el navegador');
     await seed();
