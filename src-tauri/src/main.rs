@@ -799,11 +799,6 @@ fn download_and_launch_update(url: String) -> Result<(), String> {
 
 // ---------- licencia / suscripcion ----------
 
-// Reemplaza esta URL por el link de "publicar en la web" (formato CSV) de tu
-// Google Sheet de licencias, con columnas: license_key, estado (activo/suspendido)
-const LICENSE_SHEET_URL: &str = "REEMPLAZAR_CON_TU_URL_DE_HOJA_PUBLICADA_CSV";
-const LICENSE_GRACE_DAYS: i64 = 7;
-
 fn get_or_create_license_key(conn: &Connection) -> String {
     if let Some(row) = get_item(conn, "license", "local") {
         let existing = clean_text(row.get("licenseKey"));
@@ -823,109 +818,248 @@ fn get_or_create_license_key(conn: &Connection) -> String {
     key
 }
 
-fn fetch_license_status(license_key: &str) -> Result<Option<String>, String> {
-    if LICENSE_SHEET_URL.starts_with("REEMPLAZAR_") {
-        return Err("La hoja de licencias todavia no esta configurada".into());
-    }
-    let text = http_client()
-        .get(LICENSE_SHEET_URL)
-        .send()
-        .map_err(|e| e.to_string())?
-        .text()
-        .map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or_else(|| "Hoja de licencias vacia".to_string())?;
-    let headers: Vec<String> = header
-        .split(',')
-        .map(|h| h.trim().trim_matches('"').to_lowercase())
-        .collect();
-    let key_idx = headers.iter().position(|h| h == "license_key" || h == "llave_licencia");
-    let status_idx = headers.iter().position(|h| h == "estado");
-    let (key_idx, status_idx) = match (key_idx, status_idx) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return Err("La hoja de licencias no tiene las columnas esperadas".into()),
-    };
-    for line in lines {
-        let cols: Vec<String> = line.split(',').map(|c| c.trim().trim_matches('"').to_string()).collect();
-        if cols.len() <= key_idx.max(status_idx) {
-            continue;
-        }
-        if cols[key_idx] == license_key {
-            return Ok(Some(cols[status_idx].to_lowercase()));
-        }
-    }
-    Ok(None)
+// ---------- licencia mensual (v0.2.14) ----------
+// La nube manda la licencia FIRMADA (Edge Function "licencia", Ed25519). La app solo
+// confia en lo que pasa la firma con la llave publica de abajo: editar la base local no
+// sirve. Sin licencia firmada (negocio sin licencia definida, caja pendiente o sin
+// internet desde la instalacion) NUNCA se bloquea. Bloquear nunca borra ni cambia
+// ventas, inventario ni productos: solo impide vender y hacer cambios.
+
+const LICENSE_PUBLIC_KEY_B64: &str = "owfgrcVavzb9Va6yLlX4Hh5YRFJQeuYFsFzkcBbcmT8=";
+const LICENSE_FN_URL: &str = "https://qizccncdyhzxeltwzjni.supabase.co/functions/v1/licencia";
+const LICENSE_WARN_DAYS: i64 = 3;
+const LICENSE_OFFLINE_GRACE_DAYS: i64 = 3;
+const LICENSE_UNLOCK_DAYS: i64 = 7;
+const LICENSE_REFRESH_SECS: i64 = 600;
+
+// Operaciones que se detienen con el servicio suspendido. Se siguen permitiendo:
+// entrar, consultar (data, historial, diagnostico), el Corte X/Z y el codigo de desbloqueo.
+const BLOCKED_WHEN_SUSPENDED: [&str; 15] = [
+    "checkout", "open_cash_register", "save_product", "delete_product", "movement", "delete_movement",
+    "count", "save_catalog", "delete_catalog", "cancel_sale", "save_user", "delete_user",
+    "save_settings", "save_role_permissions", "sync_batch",
+];
+
+// Version de la app (la de tauri.conf.json, la misma que publica el actualizador).
+fn app_version() -> String {
+    static CONF: &str = include_str!("../tauri.conf.json");
+    serde_json::from_str::<Value>(CONF).ok()
+        .and_then(|v| v.get("package").and_then(|p| p.get("version")).and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default()
 }
 
-fn days_between_now_and(iso: &str) -> i64 {
-    if iso.is_empty() {
-        return i64::MAX;
-    }
-    match chrono::DateTime::parse_from_rfc3339(iso) {
-        Ok(then) => {
-            let now = Utc::now();
-            (now.signed_duration_since(then.with_timezone(&Utc))).num_days()
+#[cfg(test)]
+static TEST_LICENSE_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+fn license_verifying_key() -> Option<ed25519_dalek::VerifyingKey> {
+    #[cfg(test)]
+    {
+        if let Some(k) = *TEST_LICENSE_KEY.lock().unwrap() {
+            return ed25519_dalek::VerifyingKey::from_bytes(&k).ok();
         }
-        Err(_) => i64::MAX,
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(LICENSE_PUBLIC_KEY_B64).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+}
+
+// Devuelve la licencia solo si la firma coincide con esos bytes exactos.
+fn verify_license(payload: &str, signature_b64: &str) -> Option<Value> {
+    use base64::Engine;
+    let key = license_verifying_key()?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD.decode(signature_b64.trim()).ok()?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).ok()?;
+    key.verify_strict(payload.as_bytes(), &sig).ok()?;
+    serde_json::from_str(payload).ok()
+}
+
+// Guarda la licencia que manda la nube, solo si su firma es valida.
+fn store_signed_license(conn: &Connection, payload: &str, signature: &str) -> Result<Value, String> {
+    let lic = verify_license(payload, signature).ok_or("La licencia recibida no tiene una firma valida")?;
+    create_item(conn, "license", "signed", &json!({"payload": payload, "signature": signature, "receivedAt": now_iso()}))?;
+    note_clock(conn, &clean_text(lic.get("server_time")));
+    Ok(lic)
+}
+
+fn parse_instant(iso: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(iso.trim()).ok().map(|d| d.with_timezone(&Utc))
+}
+
+fn parse_day(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s.trim().get(..10).unwrap_or(""), "%Y-%m-%d").ok()
+}
+
+// Hora mas reciente que se ha visto (de la PC o del servidor).
+fn note_clock(conn: &Connection, iso: &str) {
+    let Some(t) = parse_instant(iso) else { return };
+    let seen = get_item(conn, "license", "clock").and_then(|c| parse_instant(&clean_text(c.get("maxSeen"))));
+    if seen.map(|m| t > m + chrono::Duration::seconds(60)).unwrap_or(true) {
+        create_item(conn, "license", "clock", &json!({"maxSeen": t.to_rfc3339_opts(SecondsFormat::Millis, true)})).ok();
     }
 }
 
-#[tauri::command]
-fn check_license(db: tauri::State<DbConn>) -> Value {
-    // Igual que en sync_to_cloud: primero se lee lo necesario y se suelta el
-    // candado, y solo despues se hace la llamada de red (que puede tardar si
-    // el internet esta lento), para que el resto de la app no se congele
-    // mientras se revisa la licencia.
-    let key = {
-        let conn = match db.0.lock() {
-            Ok(c) => c,
-            Err(_) => return json!({"ok": false, "error": "Error de base de datos local"}),
-        };
-        get_or_create_license_key(&conn)
-    };
-    match fetch_license_status(&key) {
-        Ok(Some(status)) => {
-            let now_iso_val = now_iso();
-            if let Ok(conn) = db.0.lock() {
-                patch_item(&conn, "license", "local", &json!({"lastStatus": status, "lastOkIso": now_iso_val})).ok();
+// "Ahora" a prueba de relojes atrasados: si la PC marca mas de una hora antes de la
+// hora mas reciente ya vista, se usa esa (atrasar el reloj no evita el corte).
+fn effective_now(conn: &Connection) -> (chrono::DateTime<Utc>, bool) {
+    let now = Utc::now();
+    let seen = get_item(conn, "license", "clock").and_then(|c| parse_instant(&clean_text(c.get("maxSeen"))));
+    match seen {
+        Some(m) if now < m - chrono::Duration::hours(1) => (m, true),
+        _ => {
+            note_clock(conn, &now.to_rfc3339_opts(SecondsFormat::Millis, true));
+            (now, false)
+        }
+    }
+}
+
+fn day_text(d: chrono::NaiveDate) -> String {
+    d.format("%d/%m/%Y").to_string()
+}
+
+// Estado de la licencia en un instante dado (separado para poder probarlo).
+fn license_status_at(conn: &Connection, now: chrono::DateTime<Utc>, version: &str) -> Value {
+    let license_key = clean_text(get_item(conn, "license", "local").as_ref().and_then(|r| r.get("licenseKey")));
+    let signed = get_item(conn, "license", "signed");
+    let lic = signed.as_ref().and_then(|s| verify_license(&clean_text(s.get("payload")), &clean_text(s.get("signature"))));
+    let base = |state: &str, blocked: bool, message: String| json!({
+        "ok": true, "licenseKey": license_key, "state": state, "blocked": blocked, "message": message
+    });
+    let Some(lic) = lic else { return base("sin_licencia", false, String::new()) };
+    let contact = clean_text(lic.get("contact"));
+    let enforce = truthy_opt(lic.get("enforce"));
+    let today = now.with_timezone(&chrono::Local).date_naive();
+    let mut out = base("ok", false, String::new());
+    out["contact"] = json!(contact);
+    out["enforce"] = json!(enforce);
+
+    if truthy_opt(lic.get("has_license")) {
+        if let Some(paid_until) = parse_day(&clean_text(lic.get("paid_until"))) {
+            let unlock_until = get_item(conn, "license", "unlock").and_then(|u| parse_day(&clean_text(u.get("until"))));
+            let effective = match unlock_until { Some(u) if u > paid_until => u, _ => paid_until };
+            let days_left = (effective - today).num_days();
+            out["paidUntil"] = json!(paid_until.format("%Y-%m-%d").to_string());
+            out["cutDay"] = lic.get("cut_day").cloned().unwrap_or(Value::Null);
+            out["amount"] = json!(num_of(lic.get("monthly_amount")));
+            out["daysLeft"] = json!(days_left);
+            if let Some(u) = unlock_until { out["unlockedUntil"] = json!(u.format("%Y-%m-%d").to_string()); }
+            if days_left <= 0 {
+                // La ultima vez que se pudo comprobar con la nube fue ANTES del corte:
+                // puede que ya hayan pagado y simplemente no haya internet.
+                let checked_day = signed.as_ref().and_then(|s| parse_instant(&clean_text(s.get("receivedAt"))))
+                    .map(|t| t.with_timezone(&chrono::Local).date_naive());
+                let unchecked_since_cut = checked_day.map(|d| d < effective).unwrap_or(true);
+                let since_cut = (today - effective).num_days();
+                if !enforce {
+                    out["state"] = json!("vencido");
+                    out["message"] = json!(format!("El servicio venció el {}. Realiza tu pago para evitar la suspensión.", day_text(effective)));
+                } else if unchecked_since_cut && since_cut < LICENSE_OFFLINE_GRACE_DAYS {
+                    out["state"] = json!("gracia");
+                    out["message"] = json!(format!("No se ha podido confirmar el pago porque no hay internet. Quedan {} día(s) antes de la suspensión.", LICENSE_OFFLINE_GRACE_DAYS - since_cut));
+                } else {
+                    out["state"] = json!("bloqueado");
+                    out["blocked"] = json!(true);
+                    out["message"] = json!("Servicio suspendido por falta de pago.");
+                }
+            } else if days_left <= LICENSE_WARN_DAYS {
+                out["state"] = json!("aviso");
+                out["message"] = json!(format!("Tu servicio vence el {} (en {} día(s)).", day_text(effective), days_left));
             }
-            json!({"ok": true, "licenseKey": key, "status": status, "online": true})
-        }
-        Ok(None) => {
-            json!({"ok": true, "licenseKey": key, "status": "no_registrada", "online": true})
-        }
-        Err(_) => {
-            let conn = match db.0.lock() {
-                Ok(c) => c,
-                Err(_) => return json!({"ok": false, "error": "Error de base de datos local"}),
-            };
-            let row = get_item(&conn, "license", "local").unwrap_or_else(|| json!({}));
-            let last_status = clean_text(row.get("lastStatus"));
-            let last_ok = clean_text(row.get("lastOkIso"));
-            json!({"ok": true, "licenseKey": key, "status": if last_status.is_empty() {"desconocido".to_string()} else {last_status}, "online": false, "lastOkIso": last_ok})
         }
     }
+
+    // Version minima: 7 dias de aviso y despues el mismo bloqueo (solo con el bloqueo encendido).
+    let min_version = clean_text(lic.get("min_version"));
+    if !min_version.is_empty() && is_newer(&min_version, version) && out["blocked"] != json!(true) {
+        out["minVersion"] = json!(min_version);
+        let deadline = parse_instant(&clean_text(lic.get("min_version_deadline")));
+        let past = deadline.map(|d| now >= d).unwrap_or(false);
+        if past && enforce {
+            out["state"] = json!("bloqueado");
+            out["blocked"] = json!(true);
+            out["message"] = json!(format!("Esta versión de la app ({}) ya no es válida. Pulsa Actualizar para seguir vendiendo.", version));
+        } else if out["state"] == json!("ok") {
+            out["state"] = json!("aviso_version");
+            out["message"] = json!(match deadline {
+                Some(d) => format!("Actualiza la app antes del {}: esta versión dejará de ser válida.", day_text(d.with_timezone(&chrono::Local).date_naive())),
+                None => "Actualiza la app: esta versión dejará de ser válida.".to_string(),
+            });
+        }
+    }
+    out
 }
 
-fn ensure_license_allows_sale(conn: &Connection) -> Result<(), String> {
-    let row = get_item(conn, "license", "local").unwrap_or_else(|| json!({}));
-    let last_status = clean_text(row.get("lastStatus"));
-    let last_ok = clean_text(row.get("lastOkIso"));
-    if last_status == "suspendido" {
-        return Err(
-            "Cuenta suspendida por falta de pago. Contacta a tu proveedor para reactivar el punto de venta.".into(),
-        );
-    }
-    // Si todavia nunca se ha logrado confirmar la licencia (por ejemplo,
-    // recien instalada sin internet la primera vez), no bloqueamos --
-    // el limite de 7 dias solo aplica despues de haber confirmado al menos
-    // una vez y luego perder la conexion.
-    if !last_ok.is_empty() && days_between_now_and(&last_ok) > LICENSE_GRACE_DAYS {
-        return Err(
-            "No se ha podido confirmar tu licencia en mas de 7 dias. Conecta la computadora a internet para reactivar las ventas.".into(),
-        );
+fn license_status(conn: &Connection) -> Value {
+    let (now, clock_back) = effective_now(conn);
+    let mut st = license_status_at(conn, now, &app_version());
+    st["clockBack"] = json!(clock_back);
+    st
+}
+
+fn ensure_not_blocked(conn: &Connection) -> Result<(), String> {
+    let st = license_status(conn);
+    if st["blocked"] == json!(true) {
+        let contact = clean_text(st.get("contact"));
+        return Err(format!("BLOQUEO: {}{}", clean_text(st.get("message")), if contact.is_empty() { String::new() } else { format!(" {}", contact) }));
     }
     Ok(())
+}
+
+// Codigo de desbloqueo por telefono: 8 caracteres = HMAC-SHA256(secreto del negocio,
+// "licencia|AAAA-MM-DD"), igual que private.unlock_code en Supabase. Vale el dia en que
+// se genera (y el anterior o siguiente, por zonas horarias) y da 7 dias de uso.
+fn unlock_code_for(license_key: &str, secret: &str, day: chrono::NaiveDate) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("hmac acepta cualquier llave");
+    mac.update(format!("{}|{}", license_key, day.format("%Y-%m-%d")).as_bytes());
+    mac.finalize().into_bytes().iter().map(|b| format!("{:02X}", b)).collect::<String>()[..8].to_string()
+}
+
+fn op_apply_unlock_code(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    let code: String = clean_text(payload.get("code")).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
+    let signed = get_item(conn, "license", "signed").ok_or("Esta caja todavía no ha recibido su licencia")?;
+    let lic = verify_license(&clean_text(signed.get("payload")), &clean_text(signed.get("signature"))).ok_or("La licencia guardada no es válida")?;
+    let key = clean_text(lic.get("license_key"));
+    let secret = clean_text(lic.get("unlock_secret"));
+    if key.is_empty() || secret.is_empty() || code.len() != 8 {
+        return Err("Código no válido".into());
+    }
+    let (now, _) = effective_now(conn);
+    let today = now.with_timezone(&chrono::Local).date_naive();
+    let valid = [-1i64, 0, 1].iter().any(|d| unlock_code_for(&key, &secret, today + chrono::Duration::days(*d)) == code);
+    if !valid {
+        return Err("Código no válido. Revisa que lo hayas escrito igual que te lo dictaron.".into());
+    }
+    let until = today + chrono::Duration::days(LICENSE_UNLOCK_DAYS);
+    create_item(conn, "license", "unlock", &json!({"until": until.format("%Y-%m-%d").to_string(), "appliedAt": now_iso(), "user": display_or_username(&user)}))?;
+    Ok(license_status(conn))
+}
+
+// La pantalla pregunta el estado de la licencia (no usa la red: la trae el hilo de la nube).
+#[tauri::command]
+fn check_license(db: tauri::State<DbConn>) -> Value {
+    match db.0.lock() {
+        Ok(conn) => { get_or_create_license_key(&conn); license_status(&conn) }
+        Err(_) => json!({"ok": false, "error": "Error de base de datos local"}),
+    }
+}
+
+// Pide la licencia firmada a la nube (la llama el hilo de envio, fuera del candado).
+fn fetch_signed_license(token: &str) -> Result<(String, String), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.post(LICENSE_FN_URL).header("Content-Type", "application/json")
+        .json(&json!({"token": token})).send().map_err(|_| "Sin conexion con la nube".to_string())?;
+    let status = resp.status();
+    let body: Value = resp.json().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(clean_text(body.get("error")));
+    }
+    Ok((clean_text(body.get("payload")), clean_text(body.get("signature"))))
 }
 
 // ---------- operaciones ----------
@@ -1550,7 +1684,6 @@ fn op_count(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &
 fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
     let user = current_user(true, conn, sessions, token)?.unwrap();
     assert_role(&user, &["admin", "encargado", "cajero"])?;
-    ensure_license_allows_sale(conn)?;
     let cash_state = get_item(conn, "cash_state", "current").unwrap_or_else(|| json!({"isOpen": false}));
     if !cash_state.get("isOpen").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Err("Debes abrir la caja antes de la primera venta. Indica el fondo inicial para comenzar.".into());
@@ -1734,6 +1867,11 @@ fn op_sync_batch(conn: &Connection, sessions: &mut HashMap<String, Session>, tok
 }
 
 fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions: &mut HashMap<String, Session>) -> Result<Value, String> {
+    // Servicio suspendido (licencia vencida con el bloqueo encendido): se detienen ventas y
+    // cambios; se puede entrar, consultar, hacer el corte y meter el codigo de desbloqueo.
+    if BLOCKED_WHEN_SUSPENDED.contains(&op) {
+        ensure_not_blocked(conn)?;
+    }
     match op {
         "bootstrap" => op_bootstrap(conn),
         "setup_admin" => op_setup_admin(conn, payload),
@@ -1755,6 +1893,8 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "cancel_sale" => op_cancel_sale(conn, sessions, token, payload),
         "sync_batch" => op_sync_batch(conn, sessions, token, payload),
         "history" => op_history(conn, sessions, token, payload),
+        "license_status" => Ok(license_status(conn)),
+        "apply_unlock_code" => op_apply_unlock_code(conn, sessions, token, payload),
         "inventory_diagnostics" => op_inventory_diagnostics(conn, sessions, token, payload),
         "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
         "cash_cut" => op_cash_cut(conn, sessions, token, payload),
@@ -2164,6 +2304,18 @@ fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), Strin
     }
     if status != "aprobado" {
         return Ok(());
+    }
+
+    // 2b. licencia firmada (cada 10 minutos o al forzar). Si falla no se detiene el envio.
+    let last_lic = state.get("lastLicenseMs").and_then(|v| v.as_i64()).unwrap_or(0);
+    if force_heartbeat || now_millis() - last_lic >= LICENSE_REFRESH_SECS * 1000 {
+        if let Ok((payload, signature)) = fetch_signed_license(&token) {
+            with_db(app, |conn| {
+                if store_signed_license(conn, &payload, &signature).is_ok() {
+                    save_cloud_state(conn, &json!({"lastLicenseMs": now_millis()}));
+                }
+            });
+        }
     }
 
     // 3. carga inicial (una vez, al quedar aprobada): encola todo lo local
@@ -2833,6 +2985,144 @@ mod tests {
         ack_push_batch(&conn, &keys);
         assert_eq!(outbox_count(&conn), 0);
         assert!(rpc_call("pos_push", &json!({"p_token": "f".repeat(64), "p_batch": {}})).is_err());
+    }
+
+    // ---------- licencias (v0.2.14) ----------
+    // Las pruebas firman con una llave de prueba fija; la app real solo acepta la de la nube.
+
+    fn test_signer() -> ed25519_dalek::SigningKey {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        *TEST_LICENSE_KEY.lock().unwrap() = Some(sk.verifying_key().to_bytes());
+        sk
+    }
+    fn signed(lic: &Value) -> (String, String) {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let payload = lic.to_string();
+        let sig = test_signer().sign(payload.as_bytes());
+        (payload, base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
+    }
+    fn lic(paid_until: chrono::NaiveDate, enforce: bool) -> Value {
+        json!({"has_license": true, "license_key": "TP-TEST", "cut_day": 5, "monthly_amount": 350,
+               "paid_until": paid_until.format("%Y-%m-%d").to_string(), "enforce": enforce,
+               "unlock_secret": "abc123", "contact": "Pagos y soporte: 55 4297 3399",
+               "min_version": null, "min_version_deadline": null, "server_time": now_iso()})
+    }
+    fn give(conn: &Connection, l: &Value) {
+        let (p, s) = signed(l);
+        store_signed_license(conn, &p, &s).unwrap();
+    }
+    fn today() -> chrono::NaiveDate { chrono::Local::now().date_naive() }
+    fn days(n: i64) -> chrono::Duration { chrono::Duration::days(n) }
+    fn state_of(conn: &Connection) -> String { clean_text(license_status_at(conn, Utc::now(), "0.2.14").get("state")) }
+
+    #[test]
+    fn la_licencia_avisa_3_dias_antes_y_solo_bloquea_con_el_bloqueo_encendido() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 10.0, 10.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        // sin licencia: nunca bloquea
+        assert_eq!(state_of(&conn), "sin_licencia");
+        give(&conn, &lic(today() + days(4), true));
+        assert_eq!(state_of(&conn), "ok", "4 dias antes: sin aviso");
+        give(&conn, &lic(today() + days(3), true));
+        let st = license_status_at(&conn, Utc::now(), "0.2.14");
+        assert_eq!(st["state"], "aviso");
+        assert_eq!(st["daysLeft"], 3);
+        assert_eq!(st["contact"], "Pagos y soporte: 55 4297 3399");
+        give(&conn, &lic(today() + days(1), true));
+        assert_eq!(state_of(&conn), "aviso");
+        dispatch("checkout", &json!({"clientId":"S1","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":10.0}}), &t, &conn, &mut s).unwrap();
+        // dia de corte con el bloqueo APAGADO: solo avisa, se sigue vendiendo
+        give(&conn, &lic(today(), false));
+        assert_eq!(state_of(&conn), "vencido");
+        dispatch("checkout", &json!({"clientId":"S2","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":10.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+        // dia de corte con el bloqueo ENCENDIDO y ya comprobado con la nube: bloqueado
+        give(&conn, &lic(today(), true));
+        assert_eq!(state_of(&conn), "bloqueado");
+        let err = dispatch("checkout", &json!({"clientId":"S3","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":10.0}}), &t, &conn, &mut s).unwrap_err();
+        assert!(err.starts_with("BLOQUEO:") && err.contains("55 4297 3399"), "{}", err);
+        assert!(dispatch("save_product", &json!({"mode":"new","record":{"barcode":"9","name":"X","category":"B","price":1,"cost":1}}), &t, &conn, &mut s).is_err());
+        assert!(dispatch("movement", &json!({"sku":"BEB-0001","type":"entrada_compra","quantity":5}), &t, &conn, &mut s).is_err());
+        // pero se puede consultar y hacer el corte, y no se toco nada
+        dispatch("data", &json!({}), &t, &conn, &mut s).unwrap();
+        dispatch("cash_cut", &json!({"type":"x"}), &t, &conn, &mut s).unwrap();
+        dispatch("cash_cut", &json!({"type":"z"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+        assert!(get_item(&conn, "sales", "S3").is_none());
+        // al registrar el pago (la nube manda la nueva fecha) se libera
+        give(&conn, &lic(today() + days(30), true));
+        assert_eq!(state_of(&conn), "ok");
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+    }
+
+    #[test]
+    fn sin_internet_hay_3_dias_de_gracia_despues_del_corte() {
+        let (conn, _s, _t) = fresh();
+        // la ultima vez que hablo con la nube fue ANTES del corte
+        give(&conn, &lic(today() - days(1), true));
+        patch_item(&conn, "license", "signed", &json!({"receivedAt": (Utc::now() - days(3)).to_rfc3339_opts(SecondsFormat::Millis, true)})).unwrap();
+        assert_eq!(state_of(&conn), "gracia");
+        give(&conn, &lic(today() - days(3), true));
+        patch_item(&conn, "license", "signed", &json!({"receivedAt": (Utc::now() - days(5)).to_rfc3339_opts(SecondsFormat::Millis, true)})).unwrap();
+        assert_eq!(state_of(&conn), "bloqueado", "despues de 3 dias sin comprobar se suspende");
+    }
+
+    #[test]
+    fn el_codigo_por_telefono_desbloquea_7_dias() {
+        let (conn, mut s, t) = fresh();
+        // mismo algoritmo que private.unlock_code en Supabase (valor calculado alla)
+        assert_eq!(unlock_code_for("TP-TEST", "abc123", chrono::NaiveDate::from_ymd_opt(2026, 10, 17).unwrap()), "C60EE64B");
+        give(&conn, &lic(today() - days(1), true));
+        assert_eq!(state_of(&conn), "bloqueado");
+        assert!(dispatch("apply_unlock_code", &json!({"code":"ABCDEF12"}), &t, &conn, &mut s).is_err());
+        let code = unlock_code_for("TP-TEST", "abc123", today());
+        let st = dispatch("apply_unlock_code", &json!({"code": format!("{}-{}", &code[..4], code[4..].to_lowercase())}), &t, &conn, &mut s).unwrap();
+        assert_eq!(st["state"], "ok");
+        assert_eq!(st["daysLeft"], 7);
+        assert_eq!(state_of(&conn), "ok");
+        // el codigo de otro negocio no sirve
+        assert!(dispatch("apply_unlock_code", &json!({"code": unlock_code_for("TP-OTRO", "abc123", today())}), &t, &conn, &mut s).is_err());
+    }
+
+    #[test]
+    fn atrasar_el_reloj_o_alterar_la_licencia_no_evita_el_corte() {
+        let (conn, _s, _t) = fresh();
+        give(&conn, &lic(today() + days(2), true));
+        assert_eq!(state_of(&conn), "aviso");
+        // la nube ya vio una hora 6 dias adelante (4 despues del corte): atrasar el reloj de
+        // la PC no sirve; y como pasaron mas de 3 dias sin comprobar, ya no hay gracia
+        note_clock(&conn, &(Utc::now() + days(6)).to_rfc3339_opts(SecondsFormat::Millis, true));
+        let st = license_status(&conn);
+        assert_eq!(st["clockBack"], true);
+        assert_eq!(st["state"], "bloqueado");
+        // una licencia alterada (fecha cambiada a mano) ya no pasa la firma
+        let (p, s) = signed(&lic(today() + days(1), true));
+        let tampered = p.replace(&(today() + days(1)).format("%Y-%m-%d").to_string(), "2099-01-01");
+        assert!(verify_license(&tampered, &s).is_none());
+        assert!(store_signed_license(&conn, &tampered, &s).is_err());
+    }
+
+    #[test]
+    fn la_version_minima_avisa_7_dias_y_luego_bloquea() {
+        let (conn, _s, _t) = fresh();
+        let mut l = lic(today() + days(30), true);
+        l["min_version"] = json!("9.9.9");
+        l["min_version_deadline"] = json!((Utc::now() + days(5)).to_rfc3339_opts(SecondsFormat::Millis, true));
+        give(&conn, &l);
+        assert_eq!(state_of(&conn), "aviso_version");
+        l["min_version_deadline"] = json!((Utc::now() - days(1)).to_rfc3339_opts(SecondsFormat::Millis, true));
+        give(&conn, &l);
+        assert_eq!(state_of(&conn), "bloqueado");
+        // con el bloqueo apagado solo avisa
+        l["enforce"] = json!(false);
+        give(&conn, &l);
+        assert_eq!(state_of(&conn), "aviso_version");
+        // una version igual o mas nueva no avisa
+        l["min_version"] = json!("0.2.14");
+        give(&conn, &l);
+        assert_eq!(state_of(&conn), "ok");
     }
 
     // Servidor local que permite a la prueba de pantalla (tests/ui-smoke.mjs) usar la

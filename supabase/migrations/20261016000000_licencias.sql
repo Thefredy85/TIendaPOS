@@ -41,7 +41,9 @@ create index license_payments_business_idx on public.license_payments (business_
 create table public.app_policy (
   id                 boolean primary key default true check (id),
   min_version        text,
-  min_version_set_at timestamptz
+  min_version_set_at timestamptz,
+  -- lo que ve la tienda en el aviso y en la pantalla de bloqueo (p. ej. teléfono o WhatsApp)
+  contact_text       text
 );
 insert into public.app_policy (id) values (true) on conflict do nothing;
 
@@ -156,6 +158,15 @@ begin
   return jsonb_build_object('min_version', v);
 end $$;
 
+-- Texto de contacto que ven las tiendas (aviso y bloqueo).
+create or replace function public.lic_set_contact(p_text text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+begin
+  perform private.require_superadmin();
+  update public.app_policy set contact_text = nullif(left(btrim(coalesce(p_text, '')), 300), '') where id;
+  return jsonb_build_object('contact', nullif(left(btrim(coalesce(p_text, '')), 300), ''));
+end $$;
+
 -- Código de desbloqueo por teléfono: 8 caracteres, válido el día en que se genera
 -- (la caja lo acepta también el día anterior o siguiente por diferencias de zona horaria)
 -- y da 7 días más de uso. Lo calcula igual la caja, con el secreto que recibió.
@@ -200,6 +211,7 @@ begin
     'enforce', coalesce(l.enforce, false),
     'unlock_secret', l.unlock_secret,
     'min_version', p.min_version,
+    'contact', p.contact_text,
     'min_version_deadline', case when p.min_version is null then null else p.min_version_set_at + interval '7 days' end,
     'server_time', now()
   );
@@ -212,11 +224,13 @@ revoke all on function public.lic_upsert(uuid, int, numeric, date, text)        
 revoke all on function public.lic_set_enforce(uuid, boolean)                    from public, anon, authenticated;
 revoke all on function public.lic_register_payment(uuid, numeric, text, text)   from public, anon, authenticated;
 revoke all on function public.lic_set_min_version(text)                         from public, anon, authenticated;
+revoke all on function public.lic_set_contact(text)                             from public, anon, authenticated;
 revoke all on function public.lic_unlock_code(uuid)                             from public, anon, authenticated;
 revoke all on function public.pos_license(text)                                 from public, anon, authenticated;
 grant execute on function public.lic_upsert(uuid, int, numeric, date, text)      to authenticated;
 grant execute on function public.lic_set_enforce(uuid, boolean)                  to authenticated;
 grant execute on function public.lic_register_payment(uuid, numeric, text, text) to authenticated;
 grant execute on function public.lic_set_min_version(text)                       to authenticated;
+grant execute on function public.lic_set_contact(text)                           to authenticated;
 grant execute on function public.lic_unlock_code(uuid)                           to authenticated;
 grant execute on function public.pos_license(text)                               to anon;
