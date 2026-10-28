@@ -2,17 +2,25 @@ import './styles.css';
 import { sb } from './supabase';
 import { listBusinesses, listDevices, myRole, watchBusiness, type Business, type Role } from './api';
 import { esc, icon, paintIcons } from './ui';
-import { renderLogin } from './views/login';
+import { renderLogin, renderNewPassword } from './views/login';
 import { renderInicio } from './views/inicio';
 import { renderVentas } from './views/ventas';
 import { renderCortes } from './views/cortes';
 import { renderCajas } from './views/cajas';
 import { renderLicencias } from './views/licencias';
+import { renderTiendas } from './views/tiendas';
+import { renderInventario } from './views/inventario';
+import { renderMovimientos } from './views/movimientos';
+import { renderReportes } from './views/reportes';
+import { renderUsuarios } from './views/usuarios';
 
 export interface Ctx {
   business: Business;
   role: Role | null;
+  // dueño o superadmin: aprueba cajas y da accesos (el gestor solo consulta)
   canManageDevices: boolean;
+  // abre el panel de otra tienda (desde la vista de todas las tiendas)
+  openBusiness(id: string): void;
   // las vistas se suscriben para refrescarse cuando cambia algo en la nube
   onChange(fn: (table: string) => void): void;
   // tarea periódica de la vista actual (se detiene al cambiar de sección)
@@ -22,14 +30,21 @@ export interface Ctx {
 export type View = (ctx: Ctx, el: HTMLElement) => Promise<void> | void;
 
 const ROUTES: Record<string, { title: string; icon: string; view: View; superOnly?: boolean }> = {
+  // solo el dueño del sistema: todas las tiendas de un vistazo
+  tiendas: { title: 'Tiendas', icon: 'layout-grid', view: renderTiendas, superOnly: true },
   inicio: { title: 'Inicio', icon: 'house', view: renderInicio },
   ventas: { title: 'Ventas', icon: 'receipt', view: renderVentas },
   cortes: { title: 'Cortes', icon: 'calculator', view: renderCortes },
+  inventario: { title: 'Inventario', icon: 'package', view: renderInventario },
+  movimientos: { title: 'Movimientos', icon: 'arrow-left-right', view: renderMovimientos },
+  reportes: { title: 'Reportes', icon: 'chart-column', view: renderReportes },
+  usuarios: { title: 'Usuarios', icon: 'users', view: renderUsuarios },
   cajas: { title: 'Cajas', icon: 'monitor-smartphone', view: renderCajas },
-  // solo el dueño del sistema; los gestores no la ven
+  // solo el dueño del sistema; dueños y gestores ven su licencia en Inicio
   licencias: { title: 'Licencias', icon: 'key-round', view: renderLicencias, superOnly: true },
 };
 const visible = (key: string) => !ROUTES[key].superOnly || ctx?.role === 'superadmin';
+const home = () => (ctx?.role === 'superadmin' ? 'tiendas' : 'inicio');
 
 const app = document.getElementById('app')!;
 const BIZ_KEY = 'panel.business';
@@ -43,10 +58,15 @@ let stopWatch: (() => void) | null = null;
 
 function route(): string {
   const r = location.hash.replace(/^#\/?/, '').split('/')[0];
-  return ROUTES[r] && visible(r) ? r : 'inicio';
+  return ROUTES[r] && visible(r) ? r : home();
 }
 
+// Al abrir el enlace de "Olvidé mi contraseña" primero se pide la contraseña nueva
+let recovering = /type=recovery/.test(location.hash + location.search);
+const finishRecovery = () => { recovering = false; history.replaceState(null, '', location.pathname); void boot(); };
+
 async function boot() {
+  if (recovering) return renderNewPassword(app, finishRecovery);
   const { data } = await sb.auth.getSession();
   if (!data.session) return renderLogin(app, boot);
   email = data.session.user.email ?? '';
@@ -61,7 +81,7 @@ async function boot() {
   }
   if (!businesses.length) {
     app.innerHTML = `<div class="login-wrap"><div class="card login"><h1>${icon('store')} Sin negocios</h1>
-      <p>Tu usuario todavía no tiene negocios asignados. Pide al administrador que te agregue.</p>
+      <p>Tu cuenta (<b>${esc(email)}</b>) todavía no tiene acceso a ningún negocio. Pide al administrador o al dueño de la tienda que te dé acceso con este correo.</p>
       <button class="btn" id="out">Cerrar sesión</button></div></div>`;
     paintIcons();
     document.getElementById('out')!.onclick = logout;
@@ -83,6 +103,12 @@ async function selectBusiness(business: Business) {
     onChange: (fn) => listeners.push(fn),
     every: (ms, fn) => timers.push(window.setInterval(fn, ms)),
     refreshBadge: () => void refreshBadge(),
+    openBusiness: (id) => {
+      const b = businesses.find((x) => x.id === id);
+      if (!b) return;
+      history.pushState(null, '', '#/inicio'); // sin disparar hashchange: selectBusiness ya dibuja
+      void selectBusiness(b);
+    },
   };
   stopWatch = watchBusiness(business.id, (table) => {
     listeners.forEach((fn) => fn(table));
@@ -150,9 +176,11 @@ async function logout() {
   void boot();
 }
 
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => { if (!recovering) render(); });
 sb.auth.onAuthStateChange((event) => {
   if (event === 'SIGNED_OUT') { ctx = null; renderLogin(app, boot); }
+  // llegó desde el enlace de "Olvidé mi contraseña"
+  if (event === 'PASSWORD_RECOVERY') { recovering = true; stopWatch?.(); clearView(); ctx = null; renderNewPassword(app, finishRecovery); }
 });
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {

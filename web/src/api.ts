@@ -111,7 +111,7 @@ export async function listCuts(businessId: string, from: Date, to: Date): Promis
 // Avisa cuando cambian ventas, cortes o cajas del negocio (Supabase Realtime respeta RLS).
 export function watchBusiness(businessId: string, onChange: (table: string) => void): () => void {
   const ch = sb.channel(`negocio-${businessId}`);
-  for (const table of ['pos_sales', 'pos_cash_cuts', 'pos_devices']) {
+  for (const table of ['pos_sales', 'pos_cash_cuts', 'pos_devices', 'pos_inventory_movements']) {
     ch.on('postgres_changes', { event: '*', schema: 'public', table, filter: `business_id=eq.${businessId}` }, () => onChange(table));
   }
   ch.subscribe();
@@ -163,4 +163,126 @@ export async function licSetMinVersion(version: string | null) {
 }
 export async function licSetContact(text: string | null) {
   return check(await sb.rpc('lic_set_contact', { p_text: text }));
+}
+
+// ---------- inventario ----------
+
+export interface Product {
+  internal_id: string; barcode: string | null; name: string | null; category: string | null;
+  presentation: string | null; supplier: string | null; unit: string | null;
+  cost: number | null; price: number | null; stock: number | null; min_stock: number | null; active: boolean | null;
+}
+
+// Trae todos los productos activos (de 1000 en 1000: PostgREST limita cada respuesta).
+export async function listProducts(businessId: string): Promise<Product[]> {
+  const out: Product[] = [];
+  for (let from = 0; ; from += 1000) {
+    const rows = check(await sb.from('pos_products')
+      .select('internal_id, barcode, name, category, presentation, supplier, unit, cost, price, stock, min_stock, active')
+      .eq('business_id', businessId).is('deleted_at', null).order('name').range(from, from + 999));
+    out.push(...rows.map((p) => ({ ...p, cost: n(p.cost), price: n(p.price), stock: n(p.stock), min_stock: n(p.min_stock) })) as Product[]);
+    if (rows.length < 1000) return out;
+  }
+}
+
+// ---------- movimientos ----------
+
+export interface Movement {
+  id: string; ts: string | null; type: string | null; internal_id: string | null; product_name: string | null;
+  quantity: number | null; stock_before: number | null; stock_after: number | null; total_cost: number | null;
+  reason: string | null; reference: string | null; user_name: string | null; authorized_by: string | null;
+  notes: string | null; voided_at: string | null;
+}
+
+export async function listMovements(businessId: string, from: Date, to: Date,
+  opts: { type?: string; internalId?: string; withSales?: boolean; limit?: number } = {}): Promise<Movement[]> {
+  let q = sb.from('pos_inventory_movements')
+    .select('id, ts, type, internal_id, product_name, quantity, stock_before, stock_after, total_cost, reason, reference, user_name, authorized_by, notes, voided_at')
+    .eq('business_id', businessId).gte('ts', from.toISOString()).lt('ts', to.toISOString())
+    .order('ts', { ascending: false }).limit(opts.limit ?? 2000);
+  if (opts.type) q = q.eq('type', opts.type);
+  else if (!opts.withSales) q = q.neq('type', 'venta');
+  if (opts.internalId) q = q.eq('internal_id', opts.internalId);
+  return check(await q).map((m) => ({
+    ...m, quantity: n(m.quantity), stock_before: n(m.stock_before), stock_after: n(m.stock_after), total_cost: n(m.total_cost),
+  })) as Movement[];
+}
+
+// Últimos movimientos de un producto (cualquier fecha)
+export async function productMovements(businessId: string, internalId: string, limit = 30): Promise<Movement[]> {
+  return listMovements(businessId, new Date(2000, 0, 1), new Date(Date.now() + 86_400_000), { internalId, withSales: true, limit });
+}
+
+// ---------- usuarios del POS y permisos (solo lectura) ----------
+
+export interface PosUser { username: string; display_name: string | null; role: string | null; active: boolean | null }
+export type RolePermissions = Record<string, Record<string, boolean>>;
+
+export async function listPosUsers(businessId: string): Promise<PosUser[]> {
+  return check(await sb.from('pos_users').select('username, display_name, role, active')
+    .eq('business_id', businessId).is('deleted_at', null).order('display_name'));
+}
+
+export async function getRolePermissions(businessId: string): Promise<RolePermissions | null> {
+  const rows = check(await sb.from('pos_role_permissions').select('permissions, source_at')
+    .eq('business_id', businessId).order('source_at', { ascending: false }).limit(1));
+  return (rows[0]?.permissions as RolePermissions) ?? null;
+}
+
+// ---------- reportes (funciones de supabase/migrations/20261028000000_panel_tiendas.sql) ----------
+
+export interface DayRow { day: string; total: number; tickets: number; cancelled: number; profit: number }
+export interface ProductRow { internal_id: string; barcode: string | null; name: string | null; qty: number; amount: number; cost: number; tickets: number }
+export interface CashierRow { cashier: string; total: number; tickets: number; cancelled: number; cancelled_amount: number }
+
+const numRow = <T>(r: Record<string, unknown>, keys: string[]): T =>
+  ({ ...r, ...Object.fromEntries(keys.map((k) => [k, Number(r[k]) || 0])) }) as T;
+const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Mexico_City';
+
+export async function reportDaily(businessId: string, from: Date, to: Date): Promise<DayRow[]> {
+  const rows = check(await sb.rpc('panel_report_daily', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString(), p_tz: TZ }));
+  return (rows as Record<string, unknown>[]).map((r) => numRow<DayRow>(r, ['total', 'tickets', 'cancelled', 'profit']));
+}
+export async function reportProducts(businessId: string, from: Date, to: Date): Promise<ProductRow[]> {
+  const rows = check(await sb.rpc('panel_report_products', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString() }));
+  return (rows as Record<string, unknown>[]).map((r) => numRow<ProductRow>(r, ['qty', 'amount', 'cost', 'tickets']));
+}
+export async function reportCashiers(businessId: string, from: Date, to: Date): Promise<CashierRow[]> {
+  const rows = check(await sb.rpc('panel_report_cashiers', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString() }));
+  return (rows as Record<string, unknown>[]).map((r) => numRow<CashierRow>(r, ['total', 'tickets', 'cancelled', 'cancelled_amount']));
+}
+
+// ---------- accesos al panel ----------
+
+export interface Member { user_id: string; email: string; role: 'owner' | 'gestor'; created_at: string }
+
+export async function listMembers(businessId: string): Promise<Member[]> {
+  return check(await sb.rpc('panel_list_members', { p_business_id: businessId })) as Member[];
+}
+export async function addMember(businessId: string, email: string, role: 'owner' | 'gestor') {
+  return check(await sb.rpc('panel_add_member', { p_business_id: businessId, p_email: email, p_role: role }));
+}
+export async function removeMember(businessId: string, userId: string): Promise<boolean> {
+  return check(await sb.rpc('panel_remove_member', { p_business_id: businessId, p_user_id: userId })) as boolean;
+}
+
+// ---------- licencia propia (dueño y gestor) ----------
+
+export interface MyLicense { defined: boolean; cut_day?: number; monthly_amount?: number; paid_until?: string; enforce?: boolean; contact_text: string | null }
+
+export async function myLicense(businessId: string): Promise<MyLicense> {
+  const r = check(await sb.rpc('panel_my_license', { p_business_id: businessId })) as MyLicense;
+  return { ...r, monthly_amount: r.monthly_amount === undefined ? undefined : Number(r.monthly_amount) };
+}
+
+// ---------- resumen de todas las tiendas (superadmin) ----------
+
+export async function listAllDevices(): Promise<Device[]> {
+  const rows = check(await sb.from('pos_devices').select(DEVICE_COLS).order('registered_at'));
+  return rows.map((d) => ({ ...d, cash_opening_amount: n(d.cash_opening_amount) })) as Device[];
+}
+
+export async function salesSince(from: Date): Promise<{ business_id: string; total: number | null; cancelled: boolean }[]> {
+  const rows = check(await sb.from('pos_sales').select('business_id, total, cancelled').gte('ts', from.toISOString()).limit(10000));
+  return rows.map((r) => ({ ...r, total: n(r.total) }));
 }

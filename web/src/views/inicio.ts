@@ -1,6 +1,7 @@
 import type { Ctx } from '../main';
-import { listDevices, listSales, type Device, type Sale } from '../api';
-import { dayRange, esc, fmtMoney, fmtToday, icon, paintIcons, todayIso } from '../ui';
+import { listDevices, listSales, myLicense, type Device, type MyLicense, type Sale } from '../api';
+import { dayRange, esc, fmtDate, fmtMoney, fmtToday, icon, paintIcons, todayIso } from '../ui';
+import { licenseState, localIso } from '../licencia-fechas';
 import { cashLine, changeStatus, deviceName, deviceState } from './cajas';
 import { openSale, saleRow } from './ventas';
 
@@ -9,6 +10,18 @@ export async function renderInicio(ctx: Ctx, el: HTMLElement) {
   el.innerHTML = '<div class="card empty">Cargando…</div>';
   let sales: Sale[] = [];
   let devices: Device[] = [];
+  let license: MyLicense | null = null;
+
+  // Licencia propia (solo consulta). El superadmin la administra en Licencias.
+  const licenseCard = () => {
+    if (!license?.defined || !license.paid_until) return '';
+    const st = licenseState(license.paid_until, license.enforce ?? false, localIso(new Date()));
+    const cls = st.state === 'ok' ? 'info' : st.state === 'suspended' ? 'bad' : 'wait';
+    // al dueño no se le dice si el bloqueo está apagado
+    const label = st.state === 'expired' ? 'Vencida' : st.label;
+    return `<div class="banner ${cls}">${icon('key-round')}<div><b>Licencia: ${esc(label)}</b><br>
+      <span class="small">Próximo pago: ${fmtDate(`${license.paid_until}T12:00:00`)}${license.monthly_amount ? ` · ${fmtMoney(license.monthly_amount)} al mes` : ''}${license.contact_text ? ` · ${esc(license.contact_text)}` : ''}</span></div></div>`;
+  };
 
   const draw = () => {
     sub.innerHTML = `${fmtToday()} · <span class="pill ok" style="padding:1px 8px"><span class="dot ok"></span>En vivo</span>`;
@@ -16,7 +29,7 @@ export async function renderInicio(ctx: Ctx, el: HTMLElement) {
     const total = valid.reduce((a, s) => a + (s.total ?? 0), 0);
     const avg = valid.length ? total / valid.length : 0;
     const cancelled = sales.length - valid.length;
-    el.innerHTML = `
+    el.innerHTML = `${licenseCard()}
       <div class="kpis">
         <div class="card kpi"><small>Ventas de hoy</small><b>${fmtMoney(total)}</b></div>
         <div class="card kpi"><small>Tickets</small><b>${valid.length}</b></div>
@@ -57,7 +70,8 @@ export async function renderInicio(ctx: Ctx, el: HTMLElement) {
   const loadDevices = async () => { devices = await listDevices(ctx.business.id); draw(); };
 
   try {
-    await Promise.all([loadSales(), listDevices(ctx.business.id).then((d) => { devices = d; })]);
+    await Promise.all([loadSales(), listDevices(ctx.business.id).then((d) => { devices = d; }),
+      ctx.role === 'superadmin' ? null : myLicense(ctx.business.id).then((l) => { license = l; }).catch(() => { license = null; })]);
     draw();
   } catch (e) {
     el.innerHTML = `<div class="card empty">No se pudo cargar: ${esc((e as Error).message)}</div>`;

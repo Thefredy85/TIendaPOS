@@ -1,12 +1,14 @@
 import {
-  createIcons, Ban, Calculator, Check, ChevronRight, House, Info, KeyRound, LogIn, LogOut, Settings,
-  MonitorSmartphone, Receipt, ShieldAlert, Store, TriangleAlert, X,
+  createIcons, ArrowLeftRight, Ban, Calculator, ChartColumn, Check, ChevronRight, Download, House, Info, KeyRound,
+  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, Receipt, Search, Settings, ShieldAlert, Store, Trash2,
+  TriangleAlert, UserPlus, Users, X,
 } from 'lucide';
 
 // Solo los iconos que se usan (importar todos pesaba ~900 KB)
 const icons = {
-  Ban, Calculator, Check, ChevronRight, House, Info, KeyRound, LogIn, LogOut, Settings,
-  MonitorSmartphone, Receipt, ShieldAlert, Store, TriangleAlert, X,
+  ArrowLeftRight, Ban, Calculator, ChartColumn, Check, ChevronRight, Download, House, Info, KeyRound,
+  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, Receipt, Search, Settings, ShieldAlert, Store, Trash2,
+  TriangleAlert, UserPlus, Users, X,
 };
 
 // ---------- formato ----------
@@ -75,4 +77,32 @@ export function openSheet(title: string, bodyHtml: string): HTMLElement {
   document.body.append(bg);
   paintIcons();
   return bg.querySelector('.sheet-body') as HTMLElement;
+}
+
+// Mismo criterio que la app (codeKey en src/index.html, norm_code en main.rs): solo letras y números, sin ceros a la izquierda
+export const codeKey = (v: unknown) => String(v ?? '').replace(/[^0-9a-z]/gi, '').toUpperCase().replace(/^0+/, '');
+
+// Fecha local "YYYY-MM-DD" de hace N días
+export function daysAgoIso(days: number): string {
+  const t = new Date();
+  t.setDate(t.getDate() - days);
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+}
+// Rango local [desde 00:00, hasta el día siguiente 00:00)
+export function rangeOf(fromIso: string, toIso: string): [Date, Date] {
+  return [dayRange(fromIso)[0], dayRange(toIso)[1]];
+}
+
+// Descarga un CSV que Excel abre con acentos (BOM UTF-8)
+export function downloadCsv(name: string, header: string[], rows: unknown[][]) {
+  const cell = (v: unknown) => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const text = '\ufeff' + [header, ...rows].map((r) => r.map(cell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
