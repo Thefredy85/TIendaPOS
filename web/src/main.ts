@@ -2,7 +2,8 @@ import './styles.css';
 import { sb } from './supabase';
 import { listBusinesses, listDevices, myRole, watchBusiness, type Business, type Role } from './api';
 import { esc, icon, paintIcons } from './ui';
-import { renderLogin, renderNewPassword } from './views/login';
+import { renderLogin, renderNewPassword, setLoginNotice } from './views/login';
+import { idleExpired, startIdleWatch, stopIdleWatch } from './inactividad';
 import { renderInicio } from './views/inicio';
 import { renderVentas } from './views/ventas';
 import { renderCortes } from './views/cortes';
@@ -69,7 +70,10 @@ async function boot() {
   if (recovering) return renderNewPassword(app, finishRecovery);
   const { data } = await sb.auth.getSession();
   if (!data.session) return renderLogin(app, boot);
+  // sesión guardada de hace más de 5 min y medio sin uso: se pide entrar de nuevo
+  if (idleExpired()) return endForIdle();
   email = data.session.user.email ?? '';
+  startIdleWatch(endForIdle);
   try {
     businesses = await listBusinesses();
   } catch (e) {
@@ -167,7 +171,21 @@ async function refreshBadge() {
   if (b) { b.textContent = String(pending); b.hidden = pending === 0; }
 }
 
+// Cierre por inactividad: solo en este navegador (las demás sesiones del usuario siguen)
+async function endForIdle() {
+  stopIdleWatch();
+  stopWatch?.();
+  clearView();
+  ctx = null;
+  setLoginNotice('Tu sesión se cerró por inactividad. Vuelve a entrar.');
+  history.replaceState(null, '', location.pathname);
+  await sb.auth.signOut({ scope: 'local' });
+  // normalmente ya la dibujó el aviso SIGNED_OUT (con el mensaje); por si no llegó
+  if (!app.querySelector('.login')) renderLogin(app, boot);
+}
+
 async function logout() {
+  stopIdleWatch();
   stopWatch?.();
   clearView();
   await sb.auth.signOut();
@@ -178,9 +196,9 @@ async function logout() {
 
 window.addEventListener('hashchange', () => { if (!recovering) render(); });
 sb.auth.onAuthStateChange((event) => {
-  if (event === 'SIGNED_OUT') { ctx = null; renderLogin(app, boot); }
+  if (event === 'SIGNED_OUT') { stopIdleWatch(); stopWatch?.(); clearView(); ctx = null; renderLogin(app, boot); }
   // llegó desde el enlace de "Olvidé mi contraseña"
-  if (event === 'PASSWORD_RECOVERY') { recovering = true; stopWatch?.(); clearView(); ctx = null; renderNewPassword(app, finishRecovery); }
+  if (event === 'PASSWORD_RECOVERY') { recovering = true; stopIdleWatch(); stopWatch?.(); clearView(); ctx = null; renderNewPassword(app, finishRecovery); }
 });
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {

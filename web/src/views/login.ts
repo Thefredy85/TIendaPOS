@@ -1,5 +1,10 @@
 import { sb } from '../supabase';
-import { icon, paintIcons } from '../ui';
+import { esc, icon, paintIcons } from '../ui';
+import { markActive } from '../inactividad';
+
+// Aviso que se muestra una vez en la pantalla de entrada (p. ej. sesión cerrada por inactividad)
+let notice = '';
+export function setLoginNotice(text: string) { notice = text; }
 
 const MESSAGES: Record<string, string> = {
   'Invalid login credentials': 'Correo o contraseña incorrectos.',
@@ -17,6 +22,7 @@ export function renderLogin(app: HTMLElement, onDone: () => void, mode: Mode = '
   app.innerHTML = `<div class="login-wrap"><form class="card login" novalidate>
     <h1>${icon('store')} Tienda POS</h1>
     <p>${titles[mode]}</p>
+    ${notice ? `<div class="banner info small">${esc(notice)}</div>` : ''}
     <label>Correo<input name="email" type="email" autocomplete="username" required placeholder="nombre@correo.com"></label>
     ${mode !== 'olvide' ? `<label>Contraseña<input name="password" type="password" autocomplete="${mode === 'crear' ? 'new-password' : 'current-password'}" required${mode === 'crear' ? ' minlength="8"' : ''}></label>` : ''}
     ${mode === 'crear' ? '<label>Repite la contraseña<input name="password2" type="password" autocomplete="new-password" required></label>' : ''}
@@ -26,6 +32,7 @@ export function renderLogin(app: HTMLElement, onDone: () => void, mode: Mode = '
       ${mode === 'entrar' ? '<a href="#" data-mode="crear">Crear cuenta</a><a href="#" data-mode="olvide">Olvidé mi contraseña</a>' : '<a href="#" data-mode="entrar">Ya tengo cuenta, entrar</a>'}
     </div>
   </form></div>`;
+  notice = '';
   paintIcons();
   const form = app.querySelector('form')!;
   const err = form.querySelector('.err')!;
@@ -55,12 +62,13 @@ export function renderLogin(app: HTMLElement, onDone: () => void, mode: Mode = '
       const { error } = await sb.auth.signInWithPassword({ email, password });
       btn.disabled = false;
       if (error) { err.textContent = msg(error.message, 'No se pudo entrar. Revisa tu conexión e intenta de nuevo.'); return; }
+      markActive();
       onDone();
     } else if (mode === 'crear') {
       const { data, error } = await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin } });
       btn.disabled = false;
       if (error) { err.textContent = msg(error.message, 'No se pudo crear la cuenta. Intenta de nuevo.'); return; }
-      if (data.session) { onDone(); return; }
+      if (data.session) { markActive(); onDone(); return; }
       done(`Listo. Te enviamos un correo a <b>${email.replace(/</g, '&lt;')}</b>: abre el enlace para confirmar tu cuenta.<br><br>
         Después avisa al administrador (o al dueño de la tienda) para que te dé acceso a tu negocio.`);
     } else {
@@ -93,6 +101,7 @@ export function renderNewPassword(app: HTMLElement, onDone: () => void) {
     if (p1 !== p2) { err.textContent = 'Las contraseñas no coinciden.'; return; }
     const { error } = await sb.auth.updateUser({ password: p1 });
     if (error) { err.textContent = msg(error.message, 'No se pudo guardar. Intenta de nuevo.'); return; }
+    markActive();
     onDone();
   });
 }
