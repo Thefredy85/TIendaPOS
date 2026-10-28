@@ -50,14 +50,17 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - [x] Login y selector de negocio.
 - [x] Inicio: ventas del día en vivo, total, ticket promedio y estado de la caja (en línea o última conexión, versión).
 - [x] Ventas: lista con detalle, filtros por fecha y cajero, cancelaciones y devoluciones.
-- [ ] Inventario: stock actual y búsqueda por código de barras.
-- [ ] Movimientos: entradas, salidas, altas y bajas, con quién y cuándo.
+- [x] Inventario: stock actual y búsqueda por código de barras.
+- [x] Movimientos: entradas, salidas, altas y bajas, con quién y cuándo.
 - [x] Cortes X y Z: lista y vista con el formato del ticket.
-- [ ] Usuarios y permisos (solo lectura).
-- [ ] Reportes: ventas por día, por producto y por cajero.
+- [x] Usuarios y permisos (solo lectura).
+- [x] Reportes: ventas por día, por producto y por cajero.
 - [x] PWA instalable en la tablet y despliegue en Cloudflare Pages (https://tienda-pos-panel.pages.dev).
 - [x] Cajas: aprobar, rechazar o dar de baja (owner o superadmin).
-- Primera entrega publicada el 2026-10-12 (diseño A, colores del POS). Siguen: inventario, movimientos, usuarios y reportes.
+- Primera entrega publicada el 2026-10-12 (diseño A, colores del POS).
+- Segunda entrega publicada el 2026-10-28 (migración `20261028000000_panel_tiendas.sql`, solo funciones): inventario, movimientos, reportes (por día, producto y cajero), usuarios y permisos, todo con CSV.
+- Dos paneles en la misma página, según el rol: el superadmin ve **Tiendas** (todas a la vez) y **Licencias**; el **dueño** ve su tienda, aprueba cajas y da o quita accesos de gestores (Usuarios → Accesos); el **gestor** solo consulta. Dueño y gestor ven su licencia en Inicio (solo lectura).
+- Las cuentas las crea cada persona (Crear cuenta) y luego se ligan por correo. Requiere encender "Allow new users to sign up" en Supabase (Authentication).
 
 ## Fase 4: edición desde la web (requiere actualizar la app)
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.
