@@ -24,7 +24,7 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       el.innerHTML = `<div class="card empty">No se pudo cargar: ${esc((e as Error).message)}</div>`;
       return;
     }
-    sub.textContent = `Todas las tiendas · ${fmtToday()}`;
+    sub.textContent = fmtToday();
     const today = localIso(new Date());
     const lic = new Map(licenses.map((l) => [l.business_id, l]));
     const rows = businesses.map((b) => {

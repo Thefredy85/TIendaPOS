@@ -138,8 +138,8 @@ function shell(current: string): string {
     </nav>
     <main class="main">
       <div class="top">
-        <div><h1>${esc(bizLabel(ctx!.business))}</h1><div class="sub" id="sub"></div></div>
-        ${businesses.length > 1 ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
+        <div><h1>${current === 'tiendas' ? 'Todas las tiendas' : esc(bizLabel(ctx!.business))}</h1><div class="sub" id="sub"></div></div>
+        ${businesses.length > 1 && current !== 'tiendas' ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
       </div>
       <div id="view"></div>
     </main>

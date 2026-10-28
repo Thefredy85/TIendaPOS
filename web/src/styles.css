@@ -74,7 +74,7 @@ a { color: var(--accent); }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .kpi { padding: 14px 16px; }
 .kpi small { color: var(--muted); font-size: 13px; display: block; }
-.kpi b { font-size: 26px; font-weight: 600; display: block; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.kpi b { font-size: clamp(19px, 2.6vw, 26px); overflow-wrap: anywhere; font-weight: 600; display: block; margin-top: 2px; font-variant-numeric: tabular-nums; }
 .section-title { font-size: 15px; font-weight: 600; margin: 22px 0 10px; display: flex; align-items: center; gap: 8px; }
 
 .list { list-style: none; margin: 0; padding: 0; }
@@ -175,7 +175,7 @@ a { color: var(--accent); }
 @media (max-width: 760px) {
   .side { overflow-x: auto; scrollbar-width: none; }
   .side::-webkit-scrollbar { display: none; }
-  .nav { min-width: 68px; flex: none; }
+  .nav { min-width: 68px; width: auto; flex: 1 0 auto; }
   .bars { gap: 1px; }
   .bar small { display: none; }
 }
