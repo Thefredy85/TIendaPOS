@@ -266,6 +266,13 @@ export async function removeMember(businessId: string, userId: string): Promise<
   return check(await sb.rpc('panel_remove_member', { p_business_id: businessId, p_user_id: userId })) as boolean;
 }
 
+// Solo el superadmin: quien ya se registró y todavía no tiene tienda
+export interface UnassignedAccount { user_id: string; email: string; created_at: string; confirmed: boolean }
+
+export async function listUnassignedAccounts(): Promise<UnassignedAccount[]> {
+  return check(await sb.rpc('panel_unassigned_accounts')) as UnassignedAccount[];
+}
+
 // ---------- licencia propia (dueño y gestor) ----------
 
 export interface MyLicense { defined: boolean; cut_day?: number; monthly_amount?: number; paid_until?: string; enforce?: boolean; contact_text: string | null }

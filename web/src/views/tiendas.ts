@@ -1,6 +1,6 @@
 import type { Ctx } from '../main';
-import { listAllDevices, listBusinesses, listLicenses, salesSince, type Business, type Device } from '../api';
-import { dayRange, esc, fmtMoney, fmtToday, icon, paintIcons, todayIso } from '../ui';
+import { addMember, listAllDevices, listBusinesses, listLicenses, listUnassignedAccounts, salesSince, type Business, type Device, type UnassignedAccount } from '../api';
+import { dayRange, esc, fmtDate, fmtMoney, fmtToday, icon, paintIcons, todayIso, toast } from '../ui';
 import { licenseState, localIso } from '../licencia-fechas';
 import { deviceName, deviceState } from './cajas';
 
@@ -13,7 +13,12 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
     el.innerHTML = '<div class="card empty">Solo el administrador del sistema ve todas las tiendas.</div>';
     return;
   }
-  el.innerHTML = '<div class="card empty">Cargando…</div>';
+  // Dos cajas aparte: el refresco de las tiendas no debe borrar lo que se está eligiendo abajo
+  el.innerHTML = '<div id="t-main"><div class="card empty">Cargando…</div></div><div id="t-cuentas"></div>';
+  const main = el.querySelector<HTMLElement>('#t-main')!;
+  const box = el.querySelector<HTMLElement>('#t-cuentas')!;
+  let known: Business[] = [];
+  const twins = (b: Business) => known.filter((x) => (x.name || x.license_key) === (b.name || b.license_key)).length > 1;
 
   const draw = async () => {
     let businesses: Business[], devices: Device[], licenses, sales;
@@ -21,9 +26,10 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       [businesses, devices, licenses, sales] = await Promise.all([
         listBusinesses(), listAllDevices(), listLicenses(), salesSince(dayRange(todayIso())[0])]);
     } catch (e) {
-      el.innerHTML = `<div class="card empty">No se pudo cargar: ${esc((e as Error).message)}</div>`;
+      main.innerHTML = `<div class="card empty">No se pudo cargar: ${esc((e as Error).message)}</div>`;
       return;
     }
+    known = businesses;
     sub.textContent = fmtToday();
     const today = localIso(new Date());
     const lic = new Map(licenses.map((l) => [l.business_id, l]));
@@ -40,9 +46,8 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
     const online = devices.filter((d) => deviceState(d).cls === 'ok').length;
     const pending = devices.filter((d) => d.status === 'pendiente').length;
     const total = rows.reduce((a, r) => a + r.total, 0);
-    const twins = (b: Business) => businesses.filter((x) => (x.name || x.license_key) === (b.name || b.license_key)).length > 1;
 
-    el.innerHTML = `
+    main.innerHTML = `
       <div class="kpis">
         <div class="card kpi"><small>Tiendas</small><b>${businesses.length}</b></div>
         <div class="card kpi"><small>Cajas en línea</small><b>${online}</b></div>
@@ -62,9 +67,60 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       }).join('')}</ul>
       <p class="small muted">Toca una tienda para ver su panel completo.</p>`;
     paintIcons();
-    el.querySelectorAll<HTMLElement>('[data-biz]').forEach((li) => { li.onclick = () => ctx.openBusiness(li.dataset.biz!); });
+    main.querySelectorAll<HTMLElement>('[data-biz]').forEach((li) => { li.onclick = () => ctx.openBusiness(li.dataset.biz!); });
+  };
+
+  const drawAccounts = async (force = false) => {
+    // Si alguien está a medio asignar, el refresco automático espera
+    const picking = box.querySelector('select:focus') || Array.from(box.querySelectorAll<HTMLSelectElement>('[data-store]')).some((s) => s.value);
+    if (picking && !force) return;
+    let accounts: UnassignedAccount[];
+    try {
+      accounts = await listUnassignedAccounts();
+    } catch (e) {
+      box.innerHTML = `<div class="section-title">${icon('user-plus')} Cuentas sin tienda</div>
+        <div class="card empty small">No se pudo cargar: ${esc((e as Error).message)}</div>`;
+      paintIcons();
+      return;
+    }
+    const options = known.map((b) => `<option value="${b.id}">${esc(b.name || b.license_key)}${twins(b) ? ` (${esc(b.license_key)})` : ''}</option>`).join('');
+    box.innerHTML = `<div class="section-title">${icon('user-plus')} Cuentas sin tienda</div>
+      ${accounts.length ? `<ul class="list card">${accounts.map((a) => `<li class="assign" data-user="${a.user_id}">
+          <div class="grow"><div><b>${esc(a.email)}</b></div>
+            <div class="small muted">Se registró el ${fmtDate(a.created_at)}</div></div>
+          ${a.confirmed ? '' : '<span class="pill wait">Falta confirmar su correo</span>'}
+          <select data-store aria-label="Tienda para ${esc(a.email)}"><option value="">Elige la tienda…</option>${options}</select>
+          <select data-access aria-label="Acceso de ${esc(a.email)}"><option value="owner">Dueño</option><option value="gestor">Gestor (solo consulta)</option></select>
+          <button class="btn primary" type="button" data-assign disabled>Asignar</button>
+        </li>`).join('')}</ul>
+        <p class="small muted">El dueño administra su tienda y aprueba sus cajas. El gestor solo consulta.</p>`
+      : '<div class="card empty small">Todas las cuentas registradas ya tienen tienda.</div>'}`;
+    paintIcons();
+    box.querySelectorAll<HTMLElement>('[data-user]').forEach((li) => {
+      const a = accounts.find((x) => x.user_id === li.dataset.user)!;
+      const store = li.querySelector<HTMLSelectElement>('[data-store]')!;
+      const access = li.querySelector<HTMLSelectElement>('[data-access]')!;
+      const btn = li.querySelector<HTMLButtonElement>('[data-assign]')!;
+      store.onchange = () => { btn.disabled = !store.value; };
+      btn.onclick = async () => {
+        const name = store.selectedOptions[0].text;
+        const role = access.value as 'owner' | 'gestor';
+        const warn = a.confirmed ? '' : '\n\nOjo: esta persona todavía no confirma su correo.';
+        if (!confirm(`¿Dar acceso de ${access.selectedOptions[0].text} a ${a.email} en "${name}"?${warn}`)) return;
+        btn.disabled = true;
+        try {
+          await addMember(store.value, a.email, role);
+          toast('Tienda asignada');
+          await drawAccounts(true);
+        } catch (err) {
+          btn.disabled = false;
+          toast((err as Error).message);
+        }
+      };
+    });
   };
 
   await draw();
-  ctx.every(60_000, () => void draw());
+  await drawAccounts();
+  ctx.every(60_000, () => { void draw(); void drawAccounts(); });
 }

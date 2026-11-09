@@ -82,6 +82,9 @@ a { color: var(--accent); }
 .list > li:last-child { border-bottom: 0; }
 .list > li.click { cursor: pointer; }
 .list > li.click:hover { background: var(--soft); }
+.list > li.assign { flex-wrap: wrap; }
+.list > li.assign .grow { min-width: 200px; }
+.list select { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 7px 10px; max-width: 100%; }
 .grow { flex: 1; min-width: 0; }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }

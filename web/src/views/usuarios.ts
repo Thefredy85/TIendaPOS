@@ -64,7 +64,10 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
   box.innerHTML = `
     ${members.length ? `<ul class="list card">${members.map((m) => `<li>
         <div class="grow"><div><b>${esc(m.email)}</b></div><div class="small muted">Desde ${fmtDate(m.created_at)}</div></div>
-        <span class="pill ${m.role === 'owner' ? 'ok' : 'off'}">${MEMBER_LABEL[m.role]}</span>
+        ${isSuper
+          ? `<select data-role="${m.user_id}" aria-label="Acceso de ${esc(m.email)}">${(['gestor', 'owner'] as const).map((r) =>
+              `<option value="${r}"${m.role === r ? ' selected' : ''}>${MEMBER_LABEL[r]}</option>`).join('')}</select>`
+          : `<span class="pill ${m.role === 'owner' ? 'ok' : 'off'}">${MEMBER_LABEL[m.role]}</span>`}
         ${canRemove(m) ? `<button class="icon-btn" data-remove="${m.user_id}" aria-label="Quitar acceso" title="Quitar acceso">${icon('trash-2')}</button>` : ''}
       </li>`).join('')}</ul>` : '<div class="card empty small">Nadie más tiene acceso todavía.</div>'}
     <form class="card pad" id="add" style="margin-top:12px">
@@ -93,6 +96,24 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
       toast((err as Error).message);
     }
   };
+  // Cambiar de gestor a dueño o al revés (solo el superadmin ve el selector)
+  box.querySelectorAll<HTMLSelectElement>('[data-role]').forEach((s) => {
+    s.onchange = async () => {
+      const m = members.find((x) => x.user_id === s.dataset.role)!;
+      const role = s.value as Member['role'];
+      if (!confirm(`¿Cambiar a ${m.email} de ${MEMBER_LABEL[m.role]} a ${MEMBER_LABEL[role]}?`)) { s.value = m.role; return; }
+      s.disabled = true;
+      try {
+        await addMember(ctx.business.id, m.email, role);
+        toast('Acceso cambiado');
+        await drawMembers(ctx, box);
+      } catch (err) {
+        s.value = m.role;
+        s.disabled = false;
+        toast((err as Error).message);
+      }
+    };
+  });
   box.querySelectorAll<HTMLButtonElement>('[data-remove]').forEach((b) => {
     b.onclick = async () => {
       const m = members.find((x) => x.user_id === b.dataset.remove)!;
