@@ -1,8 +1,9 @@
 import type { Ctx } from '../main';
-import { addMember, listAllDevices, listBusinesses, listLicenses, listUnassignedAccounts, salesSince, type Business, type Device, type UnassignedAccount } from '../api';
+import { addMember, createAccount, listAllDevices, listBusinesses, listLicenses, listUnassignedAccounts, salesSince, type Business, type Device, type UnassignedAccount } from '../api';
 import { dayRange, esc, fmtDate, fmtMoney, fmtToday, icon, paintIcons, todayIso, toast } from '../ui';
 import { licenseState, localIso } from '../licencia-fechas';
 import { deviceName, deviceState } from './cajas';
+import { askResetPassword, showCredentials, tempPassword } from './cuentas-ui';
 
 const PILL = { none: 'off', ok: 'ok', soon: 'wait', expired: 'wait', suspended: 'bad' } as const;
 
@@ -13,12 +14,15 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
     el.innerHTML = '<div class="card empty">Solo el administrador del sistema ve todas las tiendas.</div>';
     return;
   }
-  // Dos cajas aparte: el refresco de las tiendas no debe borrar lo que se está eligiendo abajo
-  el.innerHTML = '<div id="t-main"><div class="card empty">Cargando…</div></div><div id="t-cuentas"></div>';
+  // Cajas aparte: el refresco de las tiendas no debe borrar lo que se está escribiendo abajo
+  el.innerHTML = '<div id="t-main"><div class="card empty">Cargando…</div></div><div id="t-nueva"></div><div id="t-cuentas"></div>';
   const main = el.querySelector<HTMLElement>('#t-main')!;
+  const nueva = el.querySelector<HTMLElement>('#t-nueva')!;
   const box = el.querySelector<HTMLElement>('#t-cuentas')!;
   let known: Business[] = [];
   const twins = (b: Business) => known.filter((x) => (x.name || x.license_key) === (b.name || b.license_key)).length > 1;
+  const storeOptions = () => known.map((b) => `<option value="${b.id}">${esc(b.name || b.license_key)}${twins(b) ? ` (${esc(b.license_key)})` : ''}</option>`).join('');
+  const ROLE_OPTIONS = '<option value="owner">Dueño</option><option value="gestor">Gestor (solo consulta)</option>';
 
   const draw = async () => {
     let businesses: Business[], devices: Device[], licenses, sales;
@@ -70,6 +74,41 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
     main.querySelectorAll<HTMLElement>('[data-biz]').forEach((li) => { li.onclick = () => ctx.openBusiness(li.dataset.biz!); });
   };
 
+  const drawNew = () => {
+    nueva.innerHTML = `<div class="section-title">${icon('user-plus')} Crear cuenta</div>
+      <form class="card pad" id="na-form">
+        <div class="filters" style="margin:0">
+          <label class="grow-field">Correo<input type="email" id="na-email" required autocomplete="off" placeholder="correo@ejemplo.com"></label>
+          <label>Contraseña temporal<input id="na-pass" required minlength="8" maxlength="72" autocomplete="off" spellcheck="false" value="${tempPassword()}"></label>
+          <label>Tienda<select id="na-store" required><option value="">Elige la tienda…</option>${storeOptions()}</select></label>
+          <label>Acceso<select id="na-role">${ROLE_OPTIONS}</select></label>
+          <button class="btn primary" type="submit">${icon('user-plus')} Crear cuenta</button>
+        </div>
+        <p class="small muted" style="margin:10px 0 0">Al entrar por primera vez, la persona tendrá que elegir su propia contraseña.</p>
+      </form>`;
+    paintIcons();
+    const form = nueva.querySelector<HTMLFormElement>('#na-form')!;
+    const field = <T extends HTMLElement>(id: string) => form.querySelector<T>(`#${id}`)!;
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const email = field<HTMLInputElement>('na-email').value.trim();
+      const password = field<HTMLInputElement>('na-pass').value;
+      const store = field<HTMLSelectElement>('na-store');
+      const access = field<HTMLSelectElement>('na-role');
+      if (!confirm(`¿Crear la cuenta ${email} con acceso de ${access.selectedOptions[0].text} en "${store.selectedOptions[0].text}"?`)) return;
+      const btn = form.querySelector<HTMLButtonElement>('button[type=submit]')!;
+      btn.disabled = true;
+      try {
+        await createAccount(email, password, store.value, access.value as 'owner' | 'gestor');
+        showCredentials('Cuenta creada', email, password);
+        drawNew();
+      } catch (err) {
+        btn.disabled = false;
+        toast((err as Error).message);
+      }
+    };
+  };
+
   const drawAccounts = async (force = false) => {
     // Si alguien está a medio asignar, el refresco automático espera
     const picking = box.querySelector('select:focus') || Array.from(box.querySelectorAll<HTMLSelectElement>('[data-store]')).some((s) => s.value);
@@ -83,15 +122,16 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       paintIcons();
       return;
     }
-    const options = known.map((b) => `<option value="${b.id}">${esc(b.name || b.license_key)}${twins(b) ? ` (${esc(b.license_key)})` : ''}</option>`).join('');
+    const options = storeOptions();
     box.innerHTML = `<div class="section-title">${icon('user-plus')} Cuentas sin tienda</div>
       ${accounts.length ? `<ul class="list card">${accounts.map((a) => `<li class="assign" data-user="${a.user_id}">
           <div class="grow"><div><b>${esc(a.email)}</b></div>
             <div class="small muted">Se registró el ${fmtDate(a.created_at)}</div></div>
           ${a.confirmed ? '' : '<span class="pill wait">Falta confirmar su correo</span>'}
           <select data-store aria-label="Tienda para ${esc(a.email)}"><option value="">Elige la tienda…</option>${options}</select>
-          <select data-access aria-label="Acceso de ${esc(a.email)}"><option value="owner">Dueño</option><option value="gestor">Gestor (solo consulta)</option></select>
+          <select data-access aria-label="Acceso de ${esc(a.email)}">${ROLE_OPTIONS}</select>
           <button class="btn primary" type="button" data-assign disabled>Asignar</button>
+          <button class="icon-btn" type="button" data-reset aria-label="Restablecer contraseña" title="Restablecer contraseña">${icon('key-round')}</button>
         </li>`).join('')}</ul>
         <p class="small muted">El dueño administra su tienda y aprueba sus cajas. El gestor solo consulta.</p>`
       : '<div class="card empty small">Todas las cuentas registradas ya tienen tienda.</div>'}`;
@@ -102,6 +142,7 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       const access = li.querySelector<HTMLSelectElement>('[data-access]')!;
       const btn = li.querySelector<HTMLButtonElement>('[data-assign]')!;
       store.onchange = () => { btn.disabled = !store.value; };
+      li.querySelector<HTMLButtonElement>('[data-reset]')!.onclick = () => void askResetPassword(a.user_id, a.email);
       btn.onclick = async () => {
         const name = store.selectedOptions[0].text;
         const role = access.value as 'owner' | 'gestor';
@@ -121,6 +162,7 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
   };
 
   await draw();
+  if (known.length) drawNew();
   await drawAccounts();
   ctx.every(60_000, () => { void draw(); void drawAccounts(); });
 }

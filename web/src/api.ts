@@ -273,6 +273,19 @@ export async function listUnassignedAccounts(): Promise<UnassignedAccount[]> {
   return check(await sb.rpc('panel_unassigned_accounts')) as UnassignedAccount[];
 }
 
+// Solo el superadmin; lo hace la Edge Function "cuentas" (lleva la llave que el navegador no debe tener)
+async function callAccounts(body: Record<string, unknown>) {
+  const { data, error } = await sb.functions.invoke('cuentas', { body });
+  if (!error) return data;
+  let message = 'No se pudo completar. Revisa tu conexión e intenta de nuevo.';
+  try { message = (await (error as unknown as { context: Response }).context.json()).error ?? message; } catch { /* sin respuesta del servidor */ }
+  throw new Error(message);
+}
+export const createAccount = (email: string, password: string, businessId: string, role: 'owner' | 'gestor') =>
+  callAccounts({ action: 'create', email, password, business_id: businessId, role });
+export const resetAccountPassword = (userId: string, password: string) =>
+  callAccounts({ action: 'reset', user_id: userId, password });
+
 // ---------- licencia propia (dueño y gestor) ----------
 
 export interface MyLicense { defined: boolean; cut_day?: number; monthly_amount?: number; paid_until?: string; enforce?: boolean; contact_text: string | null }

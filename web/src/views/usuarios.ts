@@ -1,6 +1,7 @@
 import type { Ctx } from '../main';
 import { addMember, getRolePermissions, listMembers, listPosUsers, removeMember, type Member, type PosUser, type RolePermissions } from '../api';
 import { esc, fmtDate, icon, paintIcons, toast } from '../ui';
+import { askResetPassword } from './cuentas-ui';
 
 // Mismas etiquetas que la pantalla de Permisos de la app (PERM_LABELS en src/index.html)
 const PERM_LABELS: Record<string, string> = {
@@ -68,11 +69,12 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
           ? `<select data-role="${m.user_id}" aria-label="Acceso de ${esc(m.email)}">${(['gestor', 'owner'] as const).map((r) =>
               `<option value="${r}"${m.role === r ? ' selected' : ''}>${MEMBER_LABEL[r]}</option>`).join('')}</select>`
           : `<span class="pill ${m.role === 'owner' ? 'ok' : 'off'}">${MEMBER_LABEL[m.role]}</span>`}
+        ${isSuper ? `<button class="icon-btn" data-reset="${m.user_id}" aria-label="Restablecer contraseña" title="Restablecer contraseña">${icon('key-round')}</button>` : ''}
         ${canRemove(m) ? `<button class="icon-btn" data-remove="${m.user_id}" aria-label="Quitar acceso" title="Quitar acceso">${icon('trash-2')}</button>` : ''}
       </li>`).join('')}</ul>` : '<div class="card empty small">Nadie más tiene acceso todavía.</div>'}
     <form class="card pad" id="add" style="margin-top:12px">
       <div style="font-weight:600;margin-bottom:6px">${icon('user-plus')} Dar acceso</div>
-      <p class="small muted" style="margin:0 0 10px">La persona primero se registra en esta página con su correo (botón "Crear cuenta" en la entrada). Después escribe aquí ese mismo correo.</p>
+      <p class="small muted" style="margin:0 0 10px">${isSuper ? 'Si la persona aún no tiene cuenta, créala en Tiendas → Crear cuenta.' : 'La persona ya debe tener cuenta; las crea el administrador del sistema.'}</p>
       <div class="filters" style="margin:0">
         <label class="grow-field">Correo<input type="email" id="m-email" required placeholder="correo@ejemplo.com" autocomplete="off"></label>
         <label>Acceso<select id="m-role">
@@ -93,9 +95,16 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
       toast('Acceso agregado');
       await drawMembers(ctx, box);
     } catch (err) {
-      toast((err as Error).message);
+      const text = (err as Error).message;
+      toast(text.includes('aún no tiene cuenta') ? 'Ese correo aún no tiene cuenta. Las cuentas las crea el administrador del sistema.' : text);
     }
   };
+  box.querySelectorAll<HTMLButtonElement>('[data-reset]').forEach((b) => {
+    b.onclick = () => {
+      const m = members.find((x) => x.user_id === b.dataset.reset)!;
+      void askResetPassword(m.user_id, m.email);
+    };
+  });
   // Cambiar de gestor a dueño o al revés (solo el superadmin ve el selector)
   box.querySelectorAll<HTMLSelectElement>('[data-role]').forEach((s) => {
     s.onchange = async () => {

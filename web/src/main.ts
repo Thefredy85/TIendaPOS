@@ -62,7 +62,7 @@ function route(): string {
   return ROUTES[r] && visible(r) ? r : home();
 }
 
-// Al abrir el enlace de "Olvidé mi contraseña" primero se pide la contraseña nueva
+// Al abrir un enlace de recuperación (enviado desde Supabase) primero se pide la contraseña nueva
 let recovering = /type=recovery/.test(location.hash + location.search);
 const finishRecovery = () => { recovering = false; history.replaceState(null, '', location.pathname); void boot(); };
 
@@ -72,6 +72,10 @@ async function boot() {
   if (!data.session) return renderLogin(app, boot);
   // sesión guardada de hace más de 5 min y medio sin uso: se pide entrar de nuevo
   if (idleExpired()) return endForIdle();
+  // cuenta recién creada o contraseña restablecida por el administrador
+  if (data.session.user.user_metadata?.must_change_password) {
+    return renderNewPassword(app, finishRecovery, 'Tu contraseña es temporal. Elige una nueva para continuar.');
+  }
   email = data.session.user.email ?? '';
   startIdleWatch(endForIdle);
   try {
@@ -197,7 +201,7 @@ async function logout() {
 window.addEventListener('hashchange', () => { if (!recovering) render(); });
 sb.auth.onAuthStateChange((event) => {
   if (event === 'SIGNED_OUT') { stopIdleWatch(); stopWatch?.(); clearView(); ctx = null; renderLogin(app, boot); }
-  // llegó desde el enlace de "Olvidé mi contraseña"
+  // llegó desde un enlace de recuperación
   if (event === 'PASSWORD_RECOVERY') { recovering = true; stopIdleWatch(); stopWatch?.(); clearView(); ctx = null; renderNewPassword(app, finishRecovery); }
 });
 

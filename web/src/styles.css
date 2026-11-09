@@ -82,6 +82,7 @@ a { color: var(--accent); }
 .list > li:last-child { border-bottom: 0; }
 .list > li.click { cursor: pointer; }
 .list > li.click:hover { background: var(--soft); }
+.login-help { margin-top: 14px; text-align: center; color: var(--muted); overflow-wrap: anywhere; }
 .list > li.assign { flex-wrap: wrap; }
 .list > li.assign .grow { min-width: 200px; }
 .list select { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 7px 10px; max-width: 100%; }
