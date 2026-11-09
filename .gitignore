@@ -8,5 +8,8 @@ src-tauri/target/
 .env.*
 !.env.example
 
+# Reportes con datos de los negocios
+reportes/
+
 # Archivos locales del CLI de Supabase
 supabase/.temp/

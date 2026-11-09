@@ -3,7 +3,7 @@ import { listProducts, productMovements, type Movement, type Product } from '../
 import { codeKey, downloadCsv, esc, fmtDateTime, fmtMoney, fmtQty, icon, openSheet, paintIcons, todayIso } from '../ui';
 import { moveLabel, moveQty } from './movimientos';
 
-type Filter = '' | 'bajo' | 'negativo' | 'agotado';
+type Filter = '' | 'bajo' | 'bajo-con' | 'negativo' | 'agotado' | 'sin-existencia' | 'sin-costo';
 
 const isLow = (p: Product) => p.min_stock !== null && p.min_stock > 0 && (p.stock ?? 0) <= p.min_stock;
 
@@ -14,7 +14,10 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
       <label>Categoría<select id="f-cat"><option value="">Todas</option></select></label>
       <label>Mostrar<select id="f-state">
         <option value="">Todos</option><option value="bajo">Bajo mínimo</option>
-        <option value="agotado">Sin existencia</option><option value="negativo">En negativo</option></select></label>
+        <option value="bajo-con">Bajo mínimo con existencia</option>
+        <option value="agotado">Sin existencia</option><option value="negativo">En negativo</option>
+        <option value="sin-existencia">Sin existencia o en negativo</option>
+        <option value="sin-costo">Sin costo</option></select></label>
       <button class="btn" id="csv">${icon('download')} CSV</button>
     </div>
     <div class="kpis" id="sum"></div>
@@ -23,6 +26,9 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
   const q = el.querySelector<HTMLInputElement>('#f-q')!;
   const cat = el.querySelector<HTMLSelectElement>('#f-cat')!;
   const st = el.querySelector<HTMLSelectElement>('#f-state')!;
+  // las Alertas llegan con el filtro en la dirección: #/inventario/bajo-con
+  const preset = location.hash.split('/')[2];
+  if (preset && [...st.options].some((o) => o.value === preset)) st.value = preset;
   let products: Product[] = [];
   let shown: Product[] = [];
 
@@ -33,6 +39,9 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
     const f = st.value as Filter;
     let list = products.filter((p) => (!cat.value || p.category === cat.value)
       && (f !== 'bajo' || isLow(p))
+      && (f !== 'bajo-con' || (isLow(p) && (p.stock ?? 0) > 0))
+      && (f !== 'sin-existencia' || (p.stock ?? 0) <= 0)
+      && (f !== 'sin-costo' || !p.cost)
       && (f !== 'agotado' || (p.stock ?? 0) === 0)
       && (f !== 'negativo' || (p.stock ?? 0) < 0));
     if (!text) return list;

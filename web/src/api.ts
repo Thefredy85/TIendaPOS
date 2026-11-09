@@ -302,6 +302,21 @@ export async function listAllDevices(): Promise<Device[]> {
   return rows.map((d) => ({ ...d, cash_opening_amount: n(d.cash_opening_amount) })) as Device[];
 }
 
+// Ventas canceladas desde una fecha (las viejas pueden no tener cancelled_at: se usa su fecha de venta)
+export interface CancelledSale {
+  id: string; business_id: string; ts: string | null; total: number | null;
+  cancelled_at: string | null; cancelled_by: string | null; cancelled_authorized_by: string | null;
+}
+
+export async function listCancelled(from: Date, businessId?: string): Promise<CancelledSale[]> {
+  const iso = from.toISOString();
+  let q = sb.from('pos_sales').select('id, business_id, ts, total, cancelled_at, cancelled_by, cancelled_authorized_by')
+    .eq('cancelled', true).or(`cancelled_at.gte."${iso}",and(cancelled_at.is.null,ts.gte."${iso}")`)
+    .order('ts', { ascending: false }).limit(500);
+  if (businessId) q = q.eq('business_id', businessId);
+  return check(await q).map((r) => ({ ...r, total: n(r.total) }));
+}
+
 export async function salesSince(from: Date): Promise<{ business_id: string; total: number | null; cancelled: boolean }[]> {
   const rows = check(await sb.from('pos_sales').select('business_id, total, cancelled').gte('ts', from.toISOString()).limit(10000));
   return rows.map((r) => ({ ...r, total: n(r.total) }));

@@ -60,7 +60,7 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - Primera entrega publicada el 2026-10-12 (diseño A, colores del POS).
 - Segunda entrega publicada el 2026-10-28 (migración `20261028000000_panel_tiendas.sql`, solo funciones): inventario, movimientos, reportes (por día, producto y cajero), usuarios y permisos, todo con CSV.
 - Dos paneles en la misma página, según el rol: el superadmin ve **Tiendas** (todas a la vez) y **Licencias**; el **dueño** ve su tienda, aprueba cajas y da o quita accesos de gestores (Usuarios → Accesos); el **gestor** solo consulta. Dueño y gestor ven su licencia en Inicio (solo lectura).
-- Las cuentas las crea cada persona (Crear cuenta) y luego se ligan por correo. Requiere encender "Allow new users to sign up" en Supabase (Authentication).
+- Las cuentas las controla solo el superadmin (2026-11-09): en Tiendas → Crear cuenta da correo, contraseña temporal, tienda y rol, y restablece contraseñas desde Accesos o Cuentas sin tienda (Edge Function `cuentas`, publicada con `--no-verify-jwt`; valida la sesión y la tabla `superadmins`). El registro público sigue apagado en Supabase: no encender "Allow new users to sign up".
 
 ## Fase 4: edición desde la web (requiere actualizar la app)
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.

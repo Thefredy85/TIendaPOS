@@ -14,14 +14,16 @@ import { renderInventario } from './views/inventario';
 import { renderMovimientos } from './views/movimientos';
 import { renderReportes } from './views/reportes';
 import { renderUsuarios } from './views/usuarios';
+import { loadAlerts, renderAlertas } from './views/alertas';
 
 export interface Ctx {
   business: Business;
   role: Role | null;
   // dueño o superadmin: aprueba cajas y da accesos (el gestor solo consulta)
   canManageDevices: boolean;
-  // abre el panel de otra tienda (desde la vista de todas las tiendas)
-  openBusiness(id: string): void;
+  // abre el panel de otra tienda, en Inicio o en la sección indicada
+  openBusiness(id: string, view?: string): void;
+  setAlertCount(n: number): void;
   // las vistas se suscriben para refrescarse cuando cambia algo en la nube
   onChange(fn: (table: string) => void): void;
   // tarea periódica de la vista actual (se detiene al cambiar de sección)
@@ -34,6 +36,7 @@ const ROUTES: Record<string, { title: string; icon: string; view: View; superOnl
   // solo el dueño del sistema: todas las tiendas de un vistazo
   tiendas: { title: 'Tiendas', icon: 'layout-grid', view: renderTiendas, superOnly: true },
   inicio: { title: 'Inicio', icon: 'house', view: renderInicio },
+  alertas: { title: 'Alertas', icon: 'bell', view: renderAlertas },
   ventas: { title: 'Ventas', icon: 'receipt', view: renderVentas },
   cortes: { title: 'Cortes', icon: 'calculator', view: renderCortes },
   inventario: { title: 'Inventario', icon: 'package', view: renderInventario },
@@ -111,18 +114,20 @@ async function selectBusiness(business: Business) {
     onChange: (fn) => listeners.push(fn),
     every: (ms, fn) => timers.push(window.setInterval(fn, ms)),
     refreshBadge: () => void refreshBadge(),
-    openBusiness: (id) => {
+    openBusiness: (id, view = 'inicio') => {
       const b = businesses.find((x) => x.id === id);
       if (!b) return;
-      history.pushState(null, '', '#/inicio'); // sin disparar hashchange: selectBusiness ya dibuja
+      history.pushState(null, '', `#/${view}`); // sin disparar hashchange: selectBusiness ya dibuja
       void selectBusiness(b);
     },
+    setAlertCount: (n) => { alertCount = n; paintAlertBadge(); },
   };
   stopWatch = watchBusiness(business.id, (table) => {
     listeners.forEach((fn) => fn(table));
     if (table === 'pos_devices') void refreshBadge();
   });
   render();
+  void refreshAlerts();
 }
 
 // Si dos negocios se llaman igual (p. ej. el nombre de fabrica del POS), se agrega la licencia
@@ -134,10 +139,13 @@ function bizLabel(b: Business): string {
 
 function shell(current: string): string {
   const nav = Object.entries(ROUTES).filter(([key]) => visible(key)).map(([key, r]) =>
-    `<a class="nav${key === current ? ' on' : ''}" href="#/${key}">${icon(r.icon)}<span>${r.title}</span>${key === 'cajas' ? '<span class="count" id="badge" hidden></span>' : ''}</a>`,
+    `<a class="nav${key === current ? ' on' : ''}" href="#/${key}">${icon(r.icon)}<span>${r.title}</span>${key === 'cajas' ? '<span class="count" id="badge" hidden></span>' : ''}${key === 'alertas' ? '<span class="count" id="badge-alerts" hidden></span>' : ''}</a>`,
   ).join('');
   const options = businesses.map((b) =>
     `<option value="${b.id}"${b.id === ctx!.business.id ? ' selected' : ''}>${esc(bizLabel(b))}</option>`).join('');
+  // el superadmin ve las alertas de todas las tiendas: ahí el selector de tienda no aplica
+  const allStores = current === 'tiendas' || (current === 'alertas' && ctx!.role === 'superadmin');
+  const heading = current === 'tiendas' ? 'Todas las tiendas' : allStores ? 'Alertas de todas las tiendas' : esc(bizLabel(ctx!.business));
   return `<div class="layout">
     <nav class="side" aria-label="Secciones">
       <div class="brand">${icon('store')} Tienda POS</div>
@@ -146,8 +154,8 @@ function shell(current: string): string {
     </nav>
     <main class="main">
       <div class="top">
-        <div><h1>${current === 'tiendas' ? 'Todas las tiendas' : esc(bizLabel(ctx!.business))}</h1><div class="sub" id="sub"></div></div>
-        ${businesses.length > 1 && current !== 'tiendas' ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
+        <div><h1>${heading}</h1><div class="sub" id="sub"></div></div>
+        ${businesses.length > 1 && !allStores ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
       </div>
       <div id="view"></div>
     </main>
@@ -164,8 +172,23 @@ function render() {
   const biz = document.getElementById('biz') as HTMLSelectElement | null;
   if (biz) biz.onchange = () => selectBusiness(businesses.find((b) => b.id === biz.value)!);
   void refreshBadge();
+  paintAlertBadge();
   void ROUTES[current].view(ctx, document.getElementById('view')!);
 }
+
+// Globo de Alertas: se calcula al entrar a una tienda y cada 5 minutos (descarga productos)
+let alertCount = 0;
+function paintAlertBadge() {
+  const b = document.getElementById('badge-alerts');
+  if (b) { b.textContent = String(alertCount); b.hidden = alertCount === 0; }
+}
+async function refreshAlerts() {
+  const current = ctx;
+  if (!current) return;
+  const n = await loadAlerts(current).then((a) => a.length).catch(() => null);
+  if (n !== null && ctx === current) { alertCount = n; paintAlertBadge(); }
+}
+window.setInterval(() => void refreshAlerts(), 5 * 60_000);
 
 // Globo con el número de cajas esperando aprobación
 async function refreshBadge() {
