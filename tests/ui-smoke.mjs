@@ -602,6 +602,45 @@ async function main() {
       check(await page.evaluate((n) => state.products.find((p) => p.sku === 'BEB-0001')?.price === n, next), '11) la pantalla toma el precio nuevo');
       check(await page.evaluate((n) => state.cart.find((l) => l.sku === 'BEB-0001')?.price === n, next), '11) el ticket en curso se actualiza');
       check(await page.evaluate((n) => state.sales.length === n, sales), '11) las ventas quedan intactas');
+
+      // 11b) Entrada desde el panel: suma sobre la existencia de HOY y no cuenta doble
+      const base = await call('__test_get_product', { sku: 'BEB-0001' });
+      const move = { id: '44444444-aaaa-4bbb-8ccc-000000000001', type: 'stock_move', payload: { internal_id: 'BEB-0001', type: 'entrada_compra', quantity: 6, reason: 'Compra', by: 'dueno@correo.com' } };
+      check((await call('__test_apply_command', move)).status === 'aplicado', '11b) la caja aplica la entrada del panel');
+      await call('__test_apply_command', move);
+      await page.evaluate(() => pollRemoteChanges());
+      const moved = await call('__test_get_product', { sku: 'BEB-0001' });
+      check(moved.stock === base.stock + 6, '11b) la entrada suma una sola vez en la base', `${base.stock} -> ${moved.stock}`);
+      check(await page.evaluate((n) => state.products.find((p) => p.sku === 'BEB-0001')?.stock === n, base.stock + 6), '11b) la pantalla muestra la existencia nueva');
+      check(moved.name === base.name && moved.barcode === base.barcode && moved.price === base.price, '11b) nombre, código y precio intactos');
+      const out = { ...move, id: '44444444-aaaa-4bbb-8ccc-000000000002', payload: { ...move.payload, type: 'merma', quantity: 2 } };
+      await call('__test_apply_command', out);
+      check((await call('__test_get_product', { sku: 'BEB-0001' })).stock === base.stock + 4, '11b) la merma resta');
+
+      // 11c) Desactivar desde el panel: sale de la venta sin borrarse
+      const off = (active) => ({ id: 'x', type: 'product_active', payload: { internal_id: 'P1759000000000ABC', active } });
+      check((await call('__test_apply_command', off(false))).status === 'aplicado', '11c) la caja desactiva el producto');
+      await page.evaluate(() => pollRemoteChanges());
+      check(await page.evaluate(() => !productsInCategory('Bebidas').some((p) => p.sku === 'P1759000000000ABC')), '11c) ya no aparece en la venta');
+      const offP = await call('__test_get_product', { sku: 'P1759000000000ABC' });
+      check(offP.stock === other.stock && offP.name === other.name, '11c) conserva existencia y nombre');
+      await call('__test_apply_command', off(true));
+      await page.evaluate(() => pollRemoteChanges());
+      check(await page.evaluate(() => productsInCategory('Bebidas').some((p) => p.sku === 'P1759000000000ABC')), '11c) al activarlo vuelve a la venta');
+
+      // 11d) Alta desde el panel: nace con existencia 0 y respeta los códigos únicos
+      await call('__test_put_item', { store: 'categories', id: 'CAT-BOT', data: { id: 'CAT-BOT', name: 'Botanas', active: true } });
+      const count0 = await page.evaluate(() => state.products.length);
+      const alta = (id, barcode) => ({ id, type: 'product_create', payload: { barcode, name: 'Papas 45 g', category: 'Botanas', cost: 10, price: 18, min_stock: 2 } });
+      check((await call('__test_apply_command', alta('55555555-aaaa-4bbb-8ccc-000000000001', '7501234'))).status === 'aplicado', '11d) la caja da de alta el producto del panel');
+      const dupe = await call('__test_apply_command', alta('55555555-aaaa-4bbb-8ccc-000000000002', '0111'));
+      check(dupe.status === 'rechazado' && dupe.result.includes('Agua'), '11d) un código que ya existe (con ceros) se rechaza', JSON.stringify(dupe));
+      await page.evaluate(() => pollRemoteChanges());
+      const nuevo = await page.evaluate(() => state.products.find((p) => p.barcode === '7501234'));
+      check(nuevo && nuevo.stock === 0 && nuevo.price === 18, '11d) aparece en la pantalla con existencia 0', JSON.stringify(nuevo));
+      check(await page.evaluate((n) => state.products.length === n + 1, count0), '11d) solo se agrega uno');
+      check((await call('__test_get_product', { sku: 'BEB-0001' })).stock === base.stock + 4, '11d) los demás productos quedan intactos');
+      check(await page.evaluate((n) => state.sales.length === n, sales), '11d) las ventas quedan intactas');
     }
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();

@@ -1,5 +1,5 @@
 import type { Ctx } from '../main';
-import { cancelChange, editProduct, listDevices, listProducts, recentChanges, type ProductFields, type RemoteChange } from '../api';
+import { cancelChange, editProduct, listDevices, listProducts, recentChanges, stockMove, type MoveType, type ProductFields, type RemoteChange } from '../api';
 import { ago, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, toast } from '../ui';
 
 // Primera versión de la app que aplica las órdenes del panel
@@ -27,6 +27,21 @@ export function fieldValue(k: keyof ProductFields, v: string | number | undefine
 }
 export const changedKeys = (after: ProductFields) => Object.keys(after) as (keyof ProductFields)[];
 
+const MOVE_TEXT: Record<MoveType, string> = { entrada_compra: 'Entrada por compra', salida_manual: 'Salida manual', merma: 'Merma' };
+const KNOWN = ['product_edit', 'stock_move', 'product_active', 'product_create'];
+
+// Qué dice cada cambio en una línea
+function describe(c: RemoteChange): string {
+  const p = c.payload;
+  if (c.type === 'stock_move') {
+    const q = Number(p.quantity ?? 0);
+    return `${MOVE_TEXT[p.type as MoveType] ?? p.type} ${p.type === 'entrada_compra' ? '+' : '−'}${fmtQty(q)} · ${p.reason ?? ''}`;
+  }
+  if (c.type === 'product_active') return p.active ? 'Activar (vuelve a la venta)' : 'Desactivar (sale de la venta)';
+  if (c.type === 'product_create') return `Alta · código ${p.barcode ?? '—'} · ${p.category ?? ''} · costo ${fmtMoney(Number(p.cost ?? 0))} · precio ${fmtMoney(Number(p.price ?? 0))}`;
+  return changedKeys(p.after).map((k) => `${FIELD_LABEL[k]} ${fieldValue(k, p.before[k])} → ${fieldValue(k, p.after[k])}`).join(' · ');
+}
+
 const PILL: Record<RemoteChange['status'], [string, string]> = {
   pendiente: ['wait', 'Esperando a la caja'], aplicado: ['ok', 'Aplicado'], rechazado: ['bad', 'Rechazado'], cancelado: ['off', 'Cancelado'],
 };
@@ -41,7 +56,7 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
     let changes: RemoteChange[], names: Map<string, string>, canApply: boolean;
     try {
       const [c, products, ok] = await Promise.all([recentChanges(ctx.business.id), listProducts(ctx.business.id), storeCanApply(ctx.business.id)]);
-      changes = c.filter((x) => x.type === 'product_edit');
+      changes = c.filter((x) => KNOWN.includes(x.type));
       names = new Map(products.map((p) => [p.internal_id, p.name ?? 'Sin nombre']));
       canApply = ok;
     } catch (e) {
@@ -49,15 +64,19 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
       return;
     }
     const undone = new Set(changes.filter((c) => c.status !== 'cancelado' && c.status !== 'rechazado').map((c) => c.payload.undo_of).filter(Boolean));
-    const busy = new Set(changes.filter((c) => c.status === 'pendiente').map((c) => c.payload.internal_id));
-    const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id) && !busy.has(c.payload.internal_id);
+    const busy = new Set(changes.filter((c) => c.status === 'pendiente' && c.type === 'product_edit').map((c) => c.payload.internal_id));
+    // Se deshacen cambios de datos (si no hay otro esperando) y movimientos (con el movimiento contrario)
+    const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id)
+      && (c.type === 'stock_move' || (c.type === 'product_edit' && !busy.has(c.payload.internal_id)));
+    const title = (c: RemoteChange) => c.type === 'product_create' ? (c.payload.name ?? 'Producto nuevo')
+      : names.get(c.payload.internal_id) ?? 'Producto ya no disponible';
 
     el.innerHTML = `${!canApply && ctx.canManageDevices ? `<div class="banner wait">${icon('shield-alert')}<span class="small">${esc(OLD_APP_NOTICE)}</span></div>` : ''}
       ${changes.length ? `<ul class="list card">${changes.map((c) => {
         const [cls, label] = PILL[c.status];
-        const what = changedKeys(c.payload.after).map((k) => `${FIELD_LABEL[k]} ${fieldValue(k, c.payload.before[k])} → ${fieldValue(k, c.payload.after[k])}`).join(' · ');
+        const what = describe(c);
         return `<li class="assign">
-          <div class="grow"><div><b>${esc(names.get(c.payload.internal_id) ?? 'Producto ya no disponible')}</b>${c.payload.undo_of ? ' <span class="small muted">(deshacer)</span>' : ''}</div>
+          <div class="grow"><div><b>${esc(title(c))}</b>${c.payload.undo_of ? ' <span class="small muted">(deshacer)</span>' : ''}</div>
             <div class="small">${esc(what)}</div>
             <div class="small muted" title="${esc(fmtDateTime(c.created_at))}">${esc(c.email ?? '—')} · ${esc(ago(c.created_at))}</div>
             ${c.status === 'rechazado' && c.result ? `<div class="small" style="color:var(--danger)">${esc(c.result)}</div>` : ''}</div>
@@ -82,6 +101,15 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
     el.querySelectorAll<HTMLButtonElement>('[data-undo]').forEach((b) => {
       b.onclick = () => {
         const c = changes.find((x) => x.id === b.dataset.undo)!;
+        if (c.type === 'stock_move') {
+          const back: MoveType = c.payload.type === 'entrada_compra' ? 'salida_manual' : 'entrada_compra';
+          const q = Number(c.payload.quantity ?? 0);
+          if (!confirm(`¿Deshacer este movimiento de "${title(c)}"?
+
+Se enviará ${MOVE_TEXT[back].toLowerCase()} de ${fmtQty(q)} para compensarlo.`)) return;
+          void act(() => stockMove(ctx.business.id, c.payload.internal_id, back, q, `Deshacer: ${c.payload.reason ?? ''}`.slice(0, 200), c.id), 'Enviado a la caja');
+          return;
+        }
         const lines = changedKeys(c.payload.after).map((k) => `${FIELD_LABEL[k]}: ${fieldValue(k, c.payload.after[k])} → ${fieldValue(k, c.payload.before[k])}`).join('\n');
         if (!confirm(`¿Deshacer este cambio de "${names.get(c.payload.internal_id) ?? 'producto'}"?\n\n${lines}`)) return;
         const before = Object.fromEntries(changedKeys(c.payload.after).map((k) => [k, c.payload.before[k]])) as ProductFields;

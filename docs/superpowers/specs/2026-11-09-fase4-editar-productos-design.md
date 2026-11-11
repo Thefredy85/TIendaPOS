@@ -49,3 +49,12 @@ Entradas y salidas, alta y baja de productos, catálogos, usuarios de la caja.
 1. Migración `20261109000100_fase4_editar_productos.sql`.
 2. App v0.2.15, con la rutina de diagnóstico y autorización del dueño.
 3. Panel. Si se publica antes que la app, las órdenes solo se quedan esperando y el panel lo avisa.
+
+## Paso 2 (aprobado el 2026-11-11, misma v0.2.15)
+- **Entradas y salidas** (`stock_move`): entrada por compra, salida manual o merma, con cantidad (0 < q ≤ 100,000) y motivo. La caja suma o resta sobre la existencia que tenga; nunca la fija. El movimiento se guarda con id `MOV-PANEL-<orden>`: si la orden llega dos veces, no cuenta doble. Usuario "Panel: correo" (lo pone la nube). Deshacer manda el movimiento contrario.
+- **Desactivar / activar** (`product_active`): oculta o muestra el producto en la venta; no borra nada.
+- **Alta** (`product_create`): código de barras, nombre, categoría de la lista, costo, precio y mínimo. Nace con existencia 0. Identificador interno `PW` + id de la orden (una orden repetida no crea dos). Código único revisado en la nube y en la caja (con o sin ceros), que rechaza diciendo de quién es.
+- **Revisión** (solo lectura): códigos repetidos, negativos, sin costo, precio ≤ costo, ventas sin descuento de inventario (`panel_sales_without_moves`) y nombres distintos a los de sus ventas (`panel_suspicious_products`). Descarga en Excel.
+- **Reportes**: Excel del periodo (por día, producto y cajero, ventas, movimientos, cortes e inventario).
+- Fuera: alerta de corte con diferencia y descuentos (la caja no guarda esos datos) y correo diario.
+- Migración `20261111000000_fase4_movimientos_altas.sql` (solo funciones).

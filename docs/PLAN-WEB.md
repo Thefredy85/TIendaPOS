@@ -37,14 +37,14 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - [x] Actualizar `supabase-schema.sql` como migración versionada.
 - [x] Compatibilidad: se eligió la opción 1. Las tablas viejas se cierran ya (pasan a `legacy`) y el espejo se pausa hasta la v0.2.12, que vuelve a subir todo desde lo local.
 
-## Fase 2: app v0.2.12, envío en tiempo real (sin tocar productos ni inventario)
+## Fase 2: app v0.2.14, envío en tiempo real (sin tocar productos ni inventario) ✅
 - [x] Tabla local `outbox` en SQLite. Cada venta, movimiento, corte X o Z y cambio de usuario se encola.
 - [x] Envío inmediato cuando hay internet, con reintentos y backoff. La sincronización de 20 minutos queda como respaldo.
 - [x] Latido cada 60 segundos a `pos_devices`.
 - [x] Carga inicial: un envío completo de productos, usuarios y stock actual. Solo lectura local, sin modificar nada.
-- [ ] `cargo test` y publicar.
+- [x] `cargo test` y publicar (salió en la v0.2.14, el 2026-10-16).
 - [x] Registro de cada caja con token propio; nombre = equipo de Windows y luego el nombre asignado de la tienda (migración `20261013000000`).
-- [ ] Aprobar las cajas de las 3 tiendas existentes (con confirmación del dueño).
+- [x] Aprobar las cajas de las tiendas existentes (DELFOS y Cafe Ambar aprobadas; Tienda de Conveniencia aún sin caja).
 
 ## Fase 3: panel web de lectura (`web/`)
 - [x] Login y selector de negocio.
@@ -63,6 +63,15 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - Las cuentas las controla solo el superadmin (2026-11-09): en Tiendas → Crear cuenta da correo, contraseña temporal, tienda y rol, y restablece contraseñas desde Accesos o Cuentas sin tienda (Edge Function `cuentas`, publicada con `--no-verify-jwt`; valida la sesión y la tabla `superadmins`). El registro público sigue apagado en Supabase: no encender "Allow new users to sign up".
 
 ## Fase 4: edición desde la web (requiere actualizar la app)
+Paso 1 y 2 en la v0.2.15 (diseño en `docs/superpowers/specs/2026-11-09-fase4-editar-productos-design.md`):
+- [x] Editar costo, precio, nombre, categoría y mínimo (`product_edit`), con revisión antes/después y avisos de error de dedo.
+- [x] Entradas, salidas y mermas (`stock_move`): siempre suman o restan; la orden repetida no cuenta doble.
+- [x] Desactivar y activar productos (`product_active`).
+- [x] Alta de productos (`product_create`): existencia 0, código único revisado en la nube y en la caja.
+- [x] Sección **Modificados** (30 días, cancelar lo que espera, deshacer ediciones y movimientos).
+- [x] Sección **Revisión** (solo lectura): códigos repetidos, negativos, sin costo, precio ≤ costo, ventas sin descuento y nombres distintos a sus ventas. Reportes con Excel del periodo.
+- [ ] Catálogos (categorías, presentaciones) y usuarios de la caja desde el panel.
+
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.
 - La app las descarga al tener internet, las aplica en orden, valida (por ejemplo, rechaza un código de barras duplicado) y confirma con `aplicado` o `rechazado` más el motivo.
 - El panel muestra cada cambio como "pendiente" hasta que la tienda lo confirma.
@@ -70,13 +79,20 @@ Aplicada el 2026-10-12 (`supabase/migrations/20261012000100_fase1_seguridad_y_es
 - Alcance: productos (alta, edición, precio, deshabilitar, información), catálogos, entradas y salidas, usuarios (alta, baja, permisos y restablecer contraseña).
 - Estas órdenes son acciones explícitas de un administrador, así que no violan la regla de que "las actualizaciones no modifican productos".
 
-## Fase 5: licencias (solo superadmin)
-- [ ] Tabla `licenses`: license_key, negocio, plan, vigencia y estado. Reemplaza la hoja de Google.
-- [ ] La app valida la licencia al iniciar y en cada latido, con días de gracia sin internet.
-- [ ] Sección privada del superadmin para crear, renovar y suspender licencias.
+## Fase 5: licencias (solo superadmin) ✅
+Salió en la v0.2.14 (migración `20261016000000_licencias.sql`, Edge Function `licencia`).
+- [x] Licencias mensuales por negocio: día de corte, monto, pagado hasta y bloqueo encendido o apagado.
+- [x] La app valida la licencia (firma Ed25519), avisa 3/2/1 días antes y da 3 días de gracia sin internet; suspendida solo deja corte X/Z, consulta y actualización.
+- [x] Sección Licencias del superadmin: registrar pagos, código de 8 caracteres por teléfono (7 días) y versión mínima.
 
 ## Fase 6: alertas
-Ejemplos: cancelaciones, descuentos altos, caja sin conexión, stock bajo, corte con diferencia. Primero se muestran en el panel y después como notificación push en la PWA.
+- [x] Sección Alertas en el panel (2026-11-09): caja pendiente o sin conexión, licencia, agotados, bajo mínimo, cancelaciones y sin costo.
+- [ ] Corte con diferencia y descuentos altos: hoy la caja no guarda descuentos ni el efectivo contado en el Z. Requiere que el Z pida el efectivo contado (toca cortes y el ticket de 57 mm).
+- [ ] Notificación push en la PWA.
+
+## Pendientes de integración
+- Correo diario con el resumen de alertas.
+- Corte con diferencia (ver fase 6).
 
 ## Decisiones pendientes
 - ¿Los gestores pueden editar todo o solo algunas secciones? ¿Hay permisos por gestor?

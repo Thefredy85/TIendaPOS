@@ -86,6 +86,17 @@ export async function listSales(businessId: string, from: Date, to: Date, cashie
   return check(await q).map(toSale);
 }
 
+// Todas las ventas del rango, de 1000 en 1000 (PostgREST limita cada respuesta)
+export async function listAllSales(businessId: string, from: Date, to: Date): Promise<Sale[]> {
+  const out: Sale[] = [];
+  for (let at = 0; ; at += 1000) {
+    const rows = check(await sb.from('pos_sales').select(SALE_COLS).eq('business_id', businessId)
+      .gte('ts', from.toISOString()).lt('ts', to.toISOString()).order('ts', { ascending: false }).range(at, at + 999));
+    out.push(...rows.map(toSale));
+    if (rows.length < 1000) return out;
+  }
+}
+
 export async function getSaleItems(businessId: string, saleId: string): Promise<SaleItem[]> {
   const rows = check(await sb.from('pos_sale_items').select('line_no, internal_id, barcode, name, qty, price, cost')
     .eq('business_id', businessId).eq('sale_id', saleId).order('line_no'));
@@ -188,10 +199,40 @@ export async function listProducts(businessId: string): Promise<Product[]> {
 // ---------- cambios desde la web (órdenes que aplica la caja) ----------
 
 export type ProductFields = Partial<{ cost: number; price: number; name: string; category: string; min_stock: number }>;
+export type MoveType = 'entrada_compra' | 'salida_manual' | 'merma';
+// Lo que trae cada orden según su tipo (product_edit, stock_move, product_active, product_create)
+export interface RemotePayload {
+  internal_id: string; before: ProductFields; after: ProductFields; undo_of?: string;
+  type?: MoveType; quantity?: number; reason?: string; by?: string; active?: boolean;
+  barcode?: string; name?: string; category?: string; cost?: number; price?: number; min_stock?: number;
+}
 export interface RemoteChange {
   id: string; type: string; status: 'pendiente' | 'aplicado' | 'rechazado' | 'cancelado';
-  payload: { internal_id: string; before: ProductFields; after: ProductFields; undo_of?: string };
+  payload: RemotePayload;
   created_at: string; applied_at: string | null; result: string | null; email: string | null;
+}
+
+export async function stockMove(businessId: string, internalId: string, type: MoveType, quantity: number, reason: string, undoOf: string | null = null): Promise<string> {
+  return check(await sb.rpc('panel_stock_move', { p_business_id: businessId, p_internal_id: internalId, p_type: type, p_quantity: quantity, p_reason: reason, p_undo_of: undoOf })) as string;
+}
+export async function setProductActive(businessId: string, internalId: string, active: boolean): Promise<string> {
+  return check(await sb.rpc('panel_set_product_active', { p_business_id: businessId, p_internal_id: internalId, p_active: active })) as string;
+}
+export interface NewProduct { barcode: string; name: string; category: string; cost: number; price: number; min_stock: number }
+export async function createProduct(businessId: string, p: NewProduct): Promise<string> {
+  return check(await sb.rpc('panel_create_product', {
+    p_business_id: businessId, p_barcode: p.barcode, p_name: p.name, p_category: p.category,
+    p_cost: p.cost, p_price: p.price, p_min_stock: p.min_stock,
+  })) as string;
+}
+
+export interface SuspiciousProduct { internal_id: string; barcode: string | null; name: string | null; stock: number | null; old_names: string[]; lines: number; last_seen: string | null }
+export async function suspiciousProducts(businessId: string): Promise<SuspiciousProduct[]> {
+  return check(await sb.rpc('panel_suspicious_products', { p_business_id: businessId })) as SuspiciousProduct[];
+}
+export interface SaleWithoutMove { sale_id: string; ts: string | null; internal_id: string | null; name: string | null; qty: number | null }
+export async function salesWithoutMoves(businessId: string, from: Date, to: Date): Promise<SaleWithoutMove[]> {
+  return check(await sb.rpc('panel_sales_without_moves', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString() })) as SaleWithoutMove[];
 }
 
 export async function editProduct(businessId: string, internalId: string, before: ProductFields, after: ProductFields, undoOf: string | null = null): Promise<string> {

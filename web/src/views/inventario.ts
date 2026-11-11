@@ -1,10 +1,10 @@
 import type { Ctx } from '../main';
-import { editProduct, listProducts, productMovements, recentChanges, type Movement, type Product, type ProductFields } from '../api';
+import { createProduct, editProduct, listProducts, productMovements, recentChanges, setProductActive, stockMove, type Movement, type MoveType, type Product, type ProductFields, type RemoteChange } from '../api';
 import { codeKey, downloadCsv, esc, fmtDateTime, fmtMoney, fmtQty, icon, openSheet, paintIcons, toast, todayIso } from '../ui';
 import { moveLabel, moveQty } from './movimientos';
 import { changedKeys, fieldValue, OLD_APP_NOTICE, storeCanApply } from './modificados';
 
-type Filter = '' | 'bajo' | 'bajo-con' | 'negativo' | 'agotado' | 'sin-existencia' | 'sin-costo';
+type Filter = '' | 'bajo' | 'bajo-con' | 'negativo' | 'agotado' | 'sin-existencia' | 'sin-costo' | 'desactivados';
 
 const isLow = (p: Product) => p.min_stock !== null && p.min_stock > 0 && (p.stock ?? 0) <= p.min_stock;
 
@@ -18,8 +18,10 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
         <option value="bajo-con">Bajo mínimo con existencia</option>
         <option value="agotado">Sin existencia</option><option value="negativo">En negativo</option>
         <option value="sin-existencia">Sin existencia o en negativo</option>
-        <option value="sin-costo">Sin costo</option></select></label>
+        <option value="sin-costo">Sin costo</option>
+        <option value="desactivados">Desactivados</option></select></label>
       <button class="btn" id="csv">${icon('download')} CSV</button>
+      ${ctx.canManageDevices ? `<button class="btn primary" id="new">${icon('package-plus')} Nuevo producto</button>` : ''}
     </div>
     <div class="kpis" id="sum"></div>
     <div id="list"><div class="card empty">Cargando…</div></div>`;
@@ -44,7 +46,8 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
       && (f !== 'sin-existencia' || (p.stock ?? 0) <= 0)
       && (f !== 'sin-costo' || !p.cost)
       && (f !== 'agotado' || (p.stock ?? 0) === 0)
-      && (f !== 'negativo' || (p.stock ?? 0) < 0));
+      && (f !== 'negativo' || (p.stock ?? 0) < 0)
+      && (f !== 'desactivados' || p.active === false));
     if (!text) return list;
     // Primero por código de barras (exacto, con o sin ceros), luego por identificador interno y al final por nombre
     const byCode = code ? list.filter((p) => codeKey(p.barcode) === code) : [];
@@ -75,7 +78,7 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
           const cls = s < 0 ? 'bad' : s === 0 ? 'off' : isLow(p) ? 'wait' : 'ok';
           return `<li class="click" data-i="${i}">
             <div class="grow"><div><b>${esc(p.name ?? 'Sin nombre')}</b></div>
-              <div class="small muted">${esc(p.barcode ?? 'sin código')}${p.category ? ` · ${esc(p.category)}` : ''} · ${fmtMoney(p.price)}</div></div>
+              <div class="small muted">${esc(p.barcode ?? 'sin código')}${p.category ? ` · ${esc(p.category)}` : ''} · ${fmtMoney(p.price)}${p.active === false ? ' · <span class="pill off">desactivado</span>' : ''}</div></div>
             <div class="right"><span class="pill ${cls} num">${fmtQty(s)}${p.unit ? ` ${esc(p.unit)}` : ''}</span>
               ${p.min_stock ? `<div class="small muted">mín. ${fmtQty(p.min_stock)}</div>` : ''}</div></li>`;
         }).join('')}</ul>
@@ -97,6 +100,8 @@ export async function renderInventario(ctx: Ctx, el: HTMLElement) {
     draw();
   };
 
+  const newBtn = el.querySelector<HTMLButtonElement>('#new');
+  if (newBtn) newBtn.onclick = () => void openNew(ctx, products);
   q.oninput = draw;
   cat.onchange = draw;
   st.onchange = draw;
@@ -199,25 +204,194 @@ function openEdit(ctx: Ctx, p: Product, products: Product[], canApply: boolean) 
   form();
 }
 
+const MOVE_LABEL: Record<MoveType, string> = { entrada_compra: 'Entrada por compra', salida_manual: 'Salida manual', merma: 'Merma' };
+const storeName = (ctx: Ctx) => ctx.business.name || ctx.business.license_key;
+
+// Pantalla de "¿Seguro?" dentro de la hoja (en tablet y celular es más clara que la ventana del navegador)
+function reviewScreen(body: HTMLElement, opts: { intro: string; table: string; warns: string[]; onBack: () => void; onSend: () => Promise<void> }) {
+  body.innerHTML = `<div class="small muted" style="margin-bottom:10px">${opts.intro}</div>
+    ${opts.table}
+    ${opts.warns.length ? `<div class="banner wait small" style="margin-top:12px">${icon('triangle-alert')}<div><b>¿Seguro?</b><br>${opts.warns.map(esc).join('<br>')}</div></div>` : ''}
+    <div class="modal-actions" style="margin-top:14px"><button class="btn" id="r-back">Corregir</button><button class="btn primary" id="r-send">Sí, enviar</button></div>`;
+  paintIcons();
+  body.querySelector<HTMLButtonElement>('#r-back')!.onclick = opts.onBack;
+  const send = body.querySelector<HTMLButtonElement>('#r-send')!;
+  send.onclick = async () => {
+    send.disabled = true;
+    try { await opts.onSend(); } catch (e) { send.disabled = false; toast((e as Error).message); }
+  };
+}
+
+// Entrada o salida de inventario: siempre suma o resta, nunca fija la existencia
+function openMove(ctx: Ctx, p: Product, canApply: boolean) {
+  const body = openSheet(`Entrada o salida: ${p.name ?? 'Producto'}`, '');
+  const close = () => body.closest('.sheet-bg')?.remove();
+  const stock = p.stock ?? 0;
+  let draft: { type: MoveType; qty: string; reason: string } = { type: 'entrada_compra', qty: '', reason: '' };
+  const form = () => {
+    body.innerHTML = `<form class="edit-form" novalidate>
+      <div class="small muted" style="margin-bottom:10px">Código ${esc(p.barcode ?? 'sin código')} · Existencia en la nube ${fmtQty(stock)}</div>
+      ${canApply ? '' : `<div class="banner wait small">${esc(OLD_APP_NOTICE)}</div>`}
+      <label>Tipo<select id="m-type">${(Object.keys(MOVE_LABEL) as MoveType[]).map((t) => `<option value="${t}"${t === draft.type ? ' selected' : ''}>${MOVE_LABEL[t]}</option>`).join('')}</select></label>
+      <label>Cantidad<input id="m-qty" type="number" inputmode="decimal" step="any" min="0" value="${esc(draft.qty)}" placeholder="Piezas"></label>
+      <label>Motivo<input id="m-reason" maxlength="200" value="${esc(draft.reason)}" placeholder="Ej. compra al proveedor, producto caducado"></label>
+      <div class="small muted">La caja suma o resta esta cantidad a la existencia que tenga en ese momento. No se fija un número, así no se pierden las ventas hechas mientras tanto.</div>
+      <div class="err" role="alert"></div>
+      <div class="modal-actions" style="margin-top:14px"><button class="btn" type="button" id="m-cancel">Cancelar</button><button class="btn primary" type="submit">Revisar</button></div>
+    </form>`;
+    const f = body.querySelector('form')!;
+    const val = (id: string) => f.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)!.value.trim();
+    f.querySelector<HTMLButtonElement>('#m-cancel')!.onclick = close;
+    f.onsubmit = (e) => {
+      e.preventDefault();
+      draft = { type: val('m-type') as MoveType, qty: val('m-qty'), reason: val('m-reason') };
+      const err = f.querySelector('.err')!;
+      const qty = Number(draft.qty);
+      if (!draft.qty || !Number.isFinite(qty) || qty <= 0) { err.textContent = 'La cantidad debe ser mayor que 0.'; return; }
+      if (qty > 100000) { err.textContent = 'La cantidad es demasiado grande.'; return; }
+      if (!draft.reason) { err.textContent = 'Escribe el motivo.'; return; }
+      const delta = draft.type === 'entrada_compra' ? qty : -qty;
+      const after = stock + delta;
+      const warns: string[] = [];
+      if (qty >= Math.max(50, Math.abs(stock) * 5)) warns.push(`${fmtQty(qty)} piezas es mucho para este producto (hoy tiene ${fmtQty(stock)}). Revisa si sobra un número.`);
+      if (after < 0) warns.push(`La existencia quedaría en negativo (${fmtQty(after)}).`);
+      reviewScreen(body, {
+        intro: `¿Enviar este movimiento a la caja de ${esc(storeName(ctx))}?`,
+        table: `<div class="card table-wrap"><table class="table"><tbody>
+          <tr><td>Movimiento</td><td><b>${MOVE_LABEL[draft.type]}</b></td></tr>
+          <tr><td>Cantidad</td><td><b class="num">${delta > 0 ? '+' : '−'}${fmtQty(qty)}</b></td></tr>
+          <tr><td>Existencia</td><td class="num">${fmtQty(stock)} → <b>${fmtQty(after)}</b> <span class="small muted">(aprox.: la caja pudo vender mientras tanto)</span></td></tr>
+          <tr><td>Motivo</td><td>${esc(draft.reason)}</td></tr></tbody></table></div>`,
+        warns, onBack: form,
+        onSend: async () => {
+          await stockMove(ctx.business.id, p.internal_id, draft.type, qty, draft.reason);
+          toast('Enviado a la caja. Míralo en Modificados.');
+          close();
+        },
+      });
+    };
+  };
+  form();
+}
+
+// Ocultar o volver a mostrar en la venta, sin borrar nada
+function openActive(ctx: Ctx, p: Product, canApply: boolean) {
+  const turnOn = p.active === false;
+  const body = openSheet(`${turnOn ? 'Activar' : 'Desactivar'}: ${p.name ?? 'Producto'}`, '');
+  const close = () => body.closest('.sheet-bg')?.remove();
+  reviewScreen(body, {
+    intro: `${canApply ? '' : `<div class="banner wait small" style="margin-bottom:10px">${esc(OLD_APP_NOTICE)}</div>`}¿Enviar este cambio a la caja de ${esc(storeName(ctx))}?`,
+    table: `<div class="card pad small">${turnOn
+      ? 'El producto <b>volverá a aparecer</b> en la venta de la caja.'
+      : 'El producto <b>dejará de aparecer</b> en la venta de la caja. No se borra: conserva su existencia y su historial, y se puede volver a activar.'}</div>`,
+    warns: !turnOn && (p.stock ?? 0) > 0 ? [`Todavía tiene ${fmtQty(p.stock)} en existencia.`] : [],
+    onBack: close,
+    onSend: async () => {
+      await setProductActive(ctx.business.id, p.internal_id, turnOn);
+      toast('Enviado a la caja. Míralo en Modificados.');
+      close();
+    },
+  });
+}
+
+// Alta de producto: nace con existencia 0; la existencia se agrega con una entrada
+async function openNew(ctx: Ctx, products: Product[]) {
+  let canApply = true;
+  try { canApply = await storeCanApply(ctx.business.id); } catch { /* se avisa si falla al enviar */ }
+  const body = openSheet('Nuevo producto', '');
+  const close = () => body.closest('.sheet-bg')?.remove();
+  const cats = [...new Set(products.map((x) => x.category ?? '').filter(Boolean))].sort();
+  let d = { barcode: '', name: '', category: cats[0] ?? '', cost: '', price: '', min: '0' };
+  const form = () => {
+    body.innerHTML = `<form class="edit-form" novalidate>
+      ${canApply ? '' : `<div class="banner wait small">${esc(OLD_APP_NOTICE)}</div>`}
+      <label>Código de barras<input id="n-code" required maxlength="60" inputmode="numeric" value="${esc(d.barcode)}" autocomplete="off"></label>
+      <label>Nombre<input id="n-name" required maxlength="200" value="${esc(d.name)}"></label>
+      <div class="edit-row">
+        <label>Costo<input id="n-cost" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(d.cost)}"></label>
+        <label>Precio<input id="n-price" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(d.price)}"></label>
+      </div>
+      <div class="edit-row">
+        <label>Categoría<select id="n-cat">${cats.map((c) => `<option${c === d.category ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+        <label>Mínimo<input id="n-min" type="number" inputmode="decimal" step="1" min="0" value="${esc(d.min)}"></label>
+      </div>
+      <div class="small muted">Nace con existencia 0. Para ponerle existencia, después haz una entrada desde su ficha. Si la categoría que buscas no aparece, créala primero en la caja.</div>
+      <div class="err" role="alert"></div>
+      <div class="modal-actions" style="margin-top:14px"><button class="btn" type="button" id="n-cancel">Cancelar</button><button class="btn primary" type="submit">Revisar</button></div>
+    </form>`;
+    const f = body.querySelector('form')!;
+    const val = (id: string) => f.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)!.value.trim();
+    f.querySelector<HTMLButtonElement>('#n-cancel')!.onclick = close;
+    f.onsubmit = (e) => {
+      e.preventDefault();
+      d = { barcode: val('n-code'), name: val('n-name'), category: val('n-cat'), cost: val('n-cost'), price: val('n-price'), min: val('n-min') };
+      const err = f.querySelector('.err')!;
+      if (!codeKey(d.barcode)) { err.textContent = 'El código de barras es obligatorio.'; return; }
+      const dup = products.find((x) => codeKey(x.barcode) === codeKey(d.barcode));
+      if (dup) { err.textContent = `Ese código ya es de "${dup.name ?? 'otro producto'}".`; return; }
+      if (!d.name) { err.textContent = 'Escribe el nombre.'; return; }
+      if (!d.category) { err.textContent = 'Elige una categoría.'; return; }
+      const nums = { cost: Number(d.cost), price: Number(d.price), min: Number(d.min) };
+      if ([d.cost, d.price, d.min].some((v) => v === '') || Object.values(nums).some((n) => !Number.isFinite(n) || n < 0)) {
+        err.textContent = 'Costo, precio y mínimo deben ser números de 0 en adelante.'; return;
+      }
+      const warns: string[] = [];
+      if (nums.price === 0) warns.push('El precio quedaría en $0.00.');
+      else if (nums.cost > 0 && nums.price <= nums.cost) warns.push(`El precio (${fmtMoney(nums.price)}) es igual o menor que el costo (${fmtMoney(nums.cost)}).`);
+      if (nums.cost === 0) warns.push('El costo quedaría en $0.00.');
+      const similar = products.find((x) => (x.name ?? '').trim().toLowerCase() === d.name.toLowerCase());
+      if (similar) warns.push(`Ya existe un producto llamado "${similar.name}" (código ${similar.barcode ?? 'sin código'}).`);
+      reviewScreen(body, {
+        intro: `¿Dar de alta este producto en la caja de ${esc(storeName(ctx))}?`,
+        table: `<div class="card table-wrap"><table class="table"><tbody>
+          <tr><td>Código</td><td><b>${esc(d.barcode)}</b></td></tr><tr><td>Nombre</td><td><b>${esc(d.name)}</b></td></tr>
+          <tr><td>Categoría</td><td>${esc(d.category)}</td></tr><tr><td>Costo</td><td class="num">${fmtMoney(nums.cost)}</td></tr>
+          <tr><td>Precio</td><td class="num">${fmtMoney(nums.price)}</td></tr><tr><td>Mínimo</td><td class="num">${fmtQty(nums.min)}</td></tr>
+          <tr><td>Existencia</td><td class="num">0</td></tr></tbody></table></div>`,
+        warns, onBack: form,
+        onSend: async () => {
+          await createProduct(ctx.business.id, { barcode: d.barcode, name: d.name, category: d.category, cost: nums.cost, price: nums.price, min_stock: nums.min });
+          toast('Enviado a la caja. Aparecerá en Inventario cuando la caja lo dé de alta.');
+          close();
+        },
+      });
+    };
+  };
+  form();
+}
+
 async function openProduct(ctx: Ctx, p: Product, products: Product[]) {
   const body = openSheet(p.name ?? 'Producto', '<div class="empty">Cargando…</div>');
-  let editBar = '';
+  let actions = '';
   let canApply = true;
   if (ctx.canManageDevices) {
     try {
       const [changes, ok] = await Promise.all([recentChanges(ctx.business.id), storeCanApply(ctx.business.id)]);
       canApply = ok;
-      const waiting = changes.some((c) => c.type === 'product_edit' && c.status === 'pendiente' && c.payload.internal_id === p.internal_id);
-      editBar = waiting
-        ? '<div class="banner wait small">Este producto tiene un cambio esperando a la caja. Míralo en Modificados.</div>'
-        : `<button class="btn primary" id="p-edit" style="margin-bottom:12px">${icon('pencil')} Editar</button>`;
-    } catch { /* sin datos de cambios: solo no se ofrece editar */ }
+      const waiting = (type: string) => changes.some((c: RemoteChange) => c.type === type && c.status === 'pendiente' && c.payload.internal_id === p.internal_id);
+      const notes: string[] = [];
+      const buttons: string[] = [];
+      if (waiting('product_edit')) notes.push('Tiene un cambio de datos esperando a la caja.');
+      else buttons.push(`<button class="btn primary" id="p-edit">${icon('pencil')} Editar</button>`);
+      buttons.push(`<button class="btn" id="p-move">${icon('arrow-down-up')} Entrada o salida</button>`);
+      if (waiting('stock_move')) notes.push('Tiene movimientos esperando a la caja.');
+      if (waiting('product_active')) notes.push(`Tiene un cambio para ${p.active === false ? 'activarlo' : 'desactivarlo'} esperando a la caja.`);
+      else buttons.push(`<button class="btn" id="p-active">${icon(p.active === false ? 'eye' : 'eye-off')} ${p.active === false ? 'Activar' : 'Desactivar'}</button>`);
+      actions = `${notes.length ? `<div class="banner wait small">${notes.map(esc).join(' ')} Míralo en Modificados.</div>` : ''}
+        <div class="chips" style="margin-bottom:12px">${buttons.join('')}</div>`;
+    } catch { /* sin datos de cambios: solo no se ofrecen acciones */ }
   }
-  const wireEdit = () => {
-    const b = body.querySelector<HTMLButtonElement>('#p-edit');
-    if (b) b.onclick = () => { body.closest('.sheet-bg')?.remove(); openEdit(ctx, p, products, canApply); };
+  const wire = () => {
+    const go = (id: string, fn: () => void) => {
+      const b = body.querySelector<HTMLButtonElement>(id);
+      if (b) b.onclick = () => { body.closest('.sheet-bg')?.remove(); fn(); };
+    };
+    go('#p-edit', () => openEdit(ctx, p, products, canApply));
+    go('#p-move', () => openMove(ctx, p, canApply));
+    go('#p-active', () => openActive(ctx, p, canApply));
   };
-  const head = `${editBar}<div class="card pad small" style="margin-bottom:12px">
+  const head = `${actions}<div class="card pad small" style="margin-bottom:12px">
+      ${p.active === false ? '<div style="margin-bottom:6px"><span class="pill off">Desactivado: no aparece en la venta</span></div>' : ''}
       <div>Código: <b>${esc(p.barcode ?? '—')}</b></div>
       <div class="muted">${[p.category, p.presentation, p.supplier].filter(Boolean).map(esc).join(' · ') || '—'}</div>
       <div style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap">
@@ -232,13 +406,12 @@ async function openProduct(ctx: Ctx, p: Product, products: Product[]) {
     body.innerHTML = head + (moves.length
       ? `<ul class="list card">${moves.map((m) => `<li>
           <div class="grow"><div>${moveLabel(m.type)}${m.voided_at ? ' <span class="pill off">anulado</span>' : ''}</div>
-            <div class="small muted">${fmtDateTime(m.ts)} · ${esc(m.user_name ?? '—')}</div></div>
+            <div class="small muted">${fmtDateTime(m.ts)} · ${esc(m.user_name ?? '—')}${m.reason ? ` · ${esc(m.reason)}` : ''}</div></div>
           <div class="right num">${moveQty(m)}<div class="small muted">queda ${fmtQty(m.stock_after)}</div></div></li>`).join('')}</ul>`
       : '<div class="card empty small">Sin movimientos registrados en la nube.</div>');
-    paintIcons();
   } catch (e) {
     body.innerHTML = head + `<div class="card empty">No se pudo cargar: ${esc((e as Error).message)}</div>`;
-    paintIcons();
   }
-  wireEdit();
+  paintIcons();
+  wire();
 }

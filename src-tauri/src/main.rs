@@ -2300,16 +2300,108 @@ fn apply_product_edit(conn: &Connection, payload: &Value) -> Result<bool, String
     Ok(true)
 }
 
+// Quien pidio el cambio (lo pone la nube con el correo de la sesion, no el navegador)
+fn panel_user(payload: &Value) -> String {
+    let by = clean_text(payload.get("by"));
+    if by.is_empty() { "Panel".to_string() } else { format!("Panel: {}", by) }
+}
+
+// Entrada o salida pedida desde el panel. SIEMPRE suma o resta (nunca fija la
+// existencia), asi no se pisan las ventas que la caja hizo mientras la orden esperaba.
+// El movimiento lleva el id de la orden: si la orden llega dos veces, no cuenta doble.
+fn apply_stock_move(conn: &Connection, cmd_id: &str, payload: &Value) -> Result<bool, String> {
+    if cmd_id.is_empty() { return Err("La orden no trae identificador".into()); }
+    let id = format!("MOV-PANEL-{}", cmd_id);
+    if get_item(conn, "moves", &id).is_some() { return Ok(false); }
+    let sku = clean_text(payload.get("internal_id"));
+    let product = get_item(conn, "products", &sku).ok_or("El producto ya no existe en la caja")?;
+    let mtype = clean_text(payload.get("type"));
+    if !["entrada_compra", "salida_manual", "merma"].contains(&mtype.as_str()) {
+        return Err(format!("Tipo de movimiento no permitido: {}", mtype));
+    }
+    let qty = payload.get("quantity").and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n > 0.0 && *n <= 100000.0)
+        .ok_or("La cantidad no es válida")?;
+    let reason = clean_text(payload.get("reason"));
+    if reason.is_empty() { return Err("Falta el motivo del movimiento".into()); }
+    let delta = if mtype == "entrada_compra" { qty } else { -qty };
+    let before = num_of(product.get("stock"));
+    let after = before + delta;
+    let cost = num_of(product.get("cost"));
+    patch_item(conn, "products", &sku, &json!({"stock": after}))?;
+    let rec = json!({
+        "id": id, "timestamp": now_iso(), "type": mtype, "sku": sku,
+        "productName": clean_text(product.get("name")),
+        "quantity": delta, "stockBefore": before, "stockAfter": after,
+        "unitCost": cost, "totalCost": delta * cost,
+        "reason": reason, "reference": clean_text(payload.get("reference")),
+        "user": panel_user(payload), "authorizedBy": "", "notes": "Desde el panel"
+    });
+    create_item(conn, "moves", &id, &rec)?;
+    Ok(true)
+}
+
+// Ocultar o volver a mostrar un producto en la venta. No borra nada.
+fn apply_product_active(conn: &Connection, payload: &Value) -> Result<bool, String> {
+    let sku = clean_text(payload.get("internal_id"));
+    let product = get_item(conn, "products", &sku).ok_or("El producto ya no existe en la caja")?;
+    let active = payload.get("active").and_then(|v| v.as_bool()).ok_or("La orden no dice si activar o desactivar")?;
+    if not_false(product.get("active")) == active { return Ok(false); }
+    patch_item(conn, "products", &sku, &json!({"active": active}))?;
+    Ok(true)
+}
+
+// Alta de un producto desde el panel. Nace con existencia 0 (la existencia se agrega con
+// una entrada) y con un identificador interno que sale de la orden, asi que una orden
+// repetida no crea dos productos. El codigo de barras debe ser unico (con o sin ceros).
+fn apply_product_create(conn: &Connection, cmd_id: &str, payload: &Value) -> Result<bool, String> {
+    let hex: String = cmd_id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() < 32 { return Err("La orden no trae identificador".into()); }
+    let sku = format!("PW{}", hex.to_uppercase());
+    if get_item(conn, "products", &sku).is_some() { return Ok(false); }
+    let barcode = clean_text(payload.get("barcode"));
+    let wanted = norm_code(&barcode);
+    if wanted.is_empty() { return Err("El código de barras es obligatorio".into()); }
+    if let Some(dup) = list_items(conn, "products").iter().find(|p| norm_code(&clean_text(p.get("barcode"))) == wanted) {
+        return Err(format!("Ese código de barras ya es de \"{}\" en la caja", clean_text(dup.get("name"))));
+    }
+    let name = clean_text(payload.get("name"));
+    if name.is_empty() { return Err("El nombre no puede quedar vacío".into()); }
+    let category = clean_text(payload.get("category"));
+    let cat = list_items(conn, "categories").into_iter()
+        .find(|c| clean_text(c.get("name")).to_lowercase() == category.to_lowercase())
+        .ok_or("Esa categoría no existe en la caja")?;
+    let money_of = |k: &str, label: &str| payload.get(k).and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("El {} no es válido", label));
+    let cost = money_of("cost", "costo")?;
+    let price = money_of("price", "precio")?;
+    let min = money_of("min_stock", "mínimo")?;
+    let (cost_iva, cost_wo) = iva_parts(cost);
+    let (price_iva, price_wo) = iva_parts(price);
+    create_item(conn, "products", &sku, &json!({
+        "sku": sku, "barcode": barcode, "name": name,
+        "category": clean_text(cat.get("name")),
+        "presentation": "", "supplier": "", "unit": "pieza",
+        "cost": cost, "price": price,
+        "costIva": cost_iva, "priceIva": price_iva,
+        "costWithoutIva": cost_wo, "priceWithoutIva": price_wo,
+        "stock": 0.0, "minStock": min, "description": "", "active": true
+    }))?;
+    Ok(true)
+}
+
 // Aplica una orden y dice como le fue: ("aplicado" | "rechazado", motivo)
 fn apply_command(conn: &Connection, cmd: &Value) -> (&'static str, String) {
     let payload = cmd.get("payload").cloned().unwrap_or_else(|| json!({}));
+    let cmd_id = clean_text(cmd.get("id"));
+    let mut changed = false;
     let outcome = match clean_text(cmd.get("type")).as_str() {
-        "product_edit" => {
-            let mut changed = false;
-            all_or_nothing(conn, || { changed = apply_product_edit(conn, &payload)?; Ok(()) }).map(|_| changed)
-        }
+        "product_edit" => all_or_nothing(conn, || { changed = apply_product_edit(conn, &payload)?; Ok(()) }),
+        "stock_move" => all_or_nothing(conn, || { changed = apply_stock_move(conn, &cmd_id, &payload)?; Ok(()) }),
+        "product_active" => all_or_nothing(conn, || { changed = apply_product_active(conn, &payload)?; Ok(()) }),
+        "product_create" => all_or_nothing(conn, || { changed = apply_product_create(conn, &cmd_id, &payload)?; Ok(()) }),
         other => Err(format!("Esta versión de la app no conoce la orden \"{}\"", other)),
-    };
+    }.map(|_| changed);
     match outcome {
         Ok(changed) => {
             if changed {
@@ -2643,6 +2735,90 @@ mod tests {
         assert!(apply_command(&conn, &orden("BEB-0001", json!({"category": "Bebidas"}), json!({"category": "Inventada"}))).1.contains("no existe"));
         assert_eq!(apply_command(&conn, &orden("BEB-0001", json!({"category": "Bebidas"}), json!({"category": "Botanas"}))).0, "aplicado");
         assert_eq!(apply_command(&conn, &json!({"type": "algo_nuevo", "payload": {}})).0, "rechazado");
+    }
+
+    fn mov(id: &str, sku: &str, mtype: &str, qty: f64) -> Value {
+        json!({"id": id, "type": "stock_move", "payload": {"internal_id": sku, "type": mtype, "quantity": qty, "reason": "Compra al proveedor", "by": "dueno@correo.com"}})
+    }
+
+    #[test]
+    fn movimiento_del_panel_suma_o_resta_sin_pisar_ventas() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "222", "Refresco", 18.0, 5.0);
+        // la caja vendio 3 mientras la orden esperaba: la entrada suma sobre lo que hay HOY
+        patch_item(&conn, "products", "BEB-0001", &json!({"stock": 7.0})).unwrap();
+        assert_eq!(apply_command(&conn, &mov("11111111-aaaa-4bbb-8ccc-000000000001", "BEB-0001", "entrada_compra", 12.0)), ("aplicado", String::new()));
+        assert_eq!(stock_of(&conn, "BEB-0001"), 19.0);
+        assert_eq!(apply_command(&conn, &mov("11111111-aaaa-4bbb-8ccc-000000000002", "BEB-0001", "merma", 2.0)).0, "aplicado");
+        assert_eq!(apply_command(&conn, &mov("11111111-aaaa-4bbb-8ccc-000000000003", "BEB-0001", "salida_manual", 20.0)).0, "aplicado", "puede quedar en negativo, como en la caja");
+        assert_eq!(stock_of(&conn, "BEB-0001"), -3.0);
+        let m = get_item(&conn, "moves", "MOV-PANEL-11111111-aaaa-4bbb-8ccc-000000000001").unwrap();
+        assert_eq!((num_of(m.get("stockBefore")), num_of(m.get("stockAfter")), num_of(m.get("quantity"))), (7.0, 19.0, 12.0));
+        assert_eq!(clean_text(m.get("user")), "Panel: dueno@correo.com");
+        assert_eq!(clean_text(m.get("reason")), "Compra al proveedor");
+        assert_eq!(stock_of(&conn, "BEB-0002"), 5.0, "los demás productos no cambian");
+        let p = get_item(&conn, "products", "BEB-0001").unwrap();
+        assert_eq!((num_of(p.get("price")), clean_text(p.get("name")), clean_text(p.get("barcode"))), (12.0, "Agua".to_string(), "111".to_string()));
+    }
+
+    #[test]
+    fn movimiento_repetido_no_cuenta_doble_y_lo_invalido_se_rechaza() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let c = mov("22222222-aaaa-4bbb-8ccc-000000000001", "BEB-0001", "entrada_compra", 5.0);
+        assert_eq!(apply_command(&conn, &c).0, "aplicado");
+        assert_eq!(apply_command(&conn, &c).0, "aplicado", "repetida: se confirma sin volver a sumar");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 15.0);
+        for (t, q) in [("ajuste_conteo", 3.0), ("entrada_compra", 0.0), ("entrada_compra", -4.0), ("salida_manual", f64::INFINITY), ("venta", 1.0)] {
+            assert_eq!(apply_command(&conn, &mov("22222222-aaaa-4bbb-8ccc-000000000009", "BEB-0001", t, q)).0, "rechazado", "{} {}", t, q);
+        }
+        let mut sin_motivo = mov("22222222-aaaa-4bbb-8ccc-000000000008", "BEB-0001", "entrada_compra", 1.0);
+        sin_motivo["payload"]["reason"] = json!("  ");
+        assert!(apply_command(&conn, &sin_motivo).1.contains("motivo"));
+        assert!(apply_command(&conn, &mov("22222222-aaaa-4bbb-8ccc-000000000007", "NO-EXISTE", "entrada_compra", 1.0)).1.contains("ya no existe"));
+        assert_eq!(stock_of(&conn, "BEB-0001"), 15.0);
+    }
+
+    #[test]
+    fn desactivar_desde_el_panel_oculta_sin_borrar() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let c = |a: bool| json!({"id": "x", "type": "product_active", "payload": {"internal_id": "BEB-0001", "active": a}});
+        assert_eq!(apply_command(&conn, &c(false)).0, "aplicado");
+        let p = get_item(&conn, "products", "BEB-0001").unwrap();
+        assert_eq!(p["active"], json!(false));
+        assert_eq!((stock_of(&conn, "BEB-0001"), clean_text(p.get("name"))), (10.0, "Agua".to_string()));
+        let seq = cloud_state(&conn)["remoteSeq"].as_i64();
+        assert_eq!(apply_command(&conn, &c(false)).0, "aplicado");
+        assert_eq!(cloud_state(&conn)["remoteSeq"].as_i64(), seq, "repetida: no cambia nada");
+        assert_eq!(apply_command(&conn, &c(true)).0, "aplicado");
+        assert_eq!(get_item(&conn, "products", "BEB-0001").unwrap()["active"], json!(true));
+        assert_eq!(apply_command(&conn, &json!({"id": "x", "type": "product_active", "payload": {"internal_id": "BEB-0001"}})).0, "rechazado");
+    }
+
+    #[test]
+    fn alta_desde_el_panel_crea_una_vez_y_respeta_codigos_unicos() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "0111", "Agua", 12.0, 10.0);
+        dispatch("save_catalog", &json!({"kind":"category","name":"Botanas"}), &t, &conn, &mut s).unwrap();
+        let alta = |id: &str, code: &str, cat: &str| json!({"id": id, "type": "product_create", "payload": {"barcode": code, "name": "Papas 45 g", "category": cat, "cost": 10.5, "price": 18.0, "min_stock": 3}});
+        let id = "33333333-aaaa-4bbb-8ccc-0000000000ab";
+        assert_eq!(apply_command(&conn, &alta(id, "750100", "botanas")), ("aplicado", String::new()));
+        assert_eq!(apply_command(&conn, &alta(id, "750100", "botanas")).0, "aplicado", "repetida: no crea otro");
+        assert_eq!(count(&conn), 2);
+        let p = get_item(&conn, "products", "PW33333333AAAA4BBB8CCC0000000000AB").unwrap();
+        assert_eq!((clean_text(p.get("name")), clean_text(p.get("category")), clean_text(p.get("barcode"))), ("Papas 45 g".to_string(), "Botanas".to_string(), "750100".to_string()));
+        assert_eq!((num_of(p.get("stock")), num_of(p.get("price")), num_of(p.get("cost")), num_of(p.get("minStock"))), (0.0, 18.0, 10.5, 3.0));
+        assert_eq!(num_of(p.get("priceIva")), iva_parts(18.0).0);
+        assert_eq!(p["active"], json!(true));
+        // código ya usado (con o sin ceros) se rechaza y dice de quién es
+        let why = apply_command(&conn, &alta("33333333-aaaa-4bbb-8ccc-0000000000ac", "111", "Botanas")).1;
+        assert!(why.contains("Agua"), "{}", why);
+        assert!(apply_command(&conn, &alta("33333333-aaaa-4bbb-8ccc-0000000000ad", "999", "Inventada")).1.contains("categoría"));
+        assert!(apply_command(&conn, &alta("33333333-aaaa-4bbb-8ccc-0000000000ae", "  ", "Botanas")).1.contains("obligatorio"));
+        assert_eq!(count(&conn), 2);
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0, "el producto que ya existía queda intacto");
     }
 
     #[test]

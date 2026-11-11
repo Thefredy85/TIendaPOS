@@ -1,6 +1,8 @@
 import type { Ctx } from '../main';
-import { reportCashiers, reportDaily, reportProducts, type CashierRow, type DayRow, type ProductRow } from '../api';
-import { daysAgoIso, downloadCsv, esc, fmtMoney, fmtQty, icon, paintIcons, rangeOf, todayIso } from '../ui';
+import { listAllSales, listCuts, listMovements, listProducts, reportCashiers, reportDaily, reportProducts, type CashierRow, type DayRow, type ProductRow } from '../api';
+import { downloadXlsx } from '../xlsx';
+import { moveLabel } from './movimientos';
+import { daysAgoIso, downloadCsv, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, rangeOf, toast, todayIso } from '../ui';
 
 type Tab = 'dia' | 'producto' | 'cajero';
 
@@ -30,6 +32,7 @@ export async function renderReportes(ctx: Ctx, el: HTMLElement) {
       <button class="tab" data-tab="producto">Por producto</button>
       <button class="tab" data-tab="cajero">Por cajero</button>
       <button class="btn" id="csv" style="margin-left:auto">${icon('download')} CSV</button>
+      <button class="btn" id="xlsx" title="Un archivo con ventas, productos, movimientos, cortes e inventario del periodo">${icon('file-spreadsheet')} Excel</button>
     </div>
     <div id="out"><div class="card empty">Cargando…</div></div>`;
   paintIcons();
@@ -138,6 +141,35 @@ export async function renderReportes(ctx: Ctx, el: HTMLElement) {
     else if (tab === 'producto') downloadCsv(name, ['Código de barras', 'Producto', 'Identificador interno', 'Piezas', 'Importe', 'Costo', 'Ganancia', 'Tickets'],
       sortedProds().map((p) => [p.barcode, p.name, p.internal_id, p.qty, p.amount, p.cost, +(p.amount - p.cost).toFixed(2), p.tickets]));
     else downloadCsv(name, ['Cajero', 'Ventas', 'Tickets', 'Canceladas', 'Importe cancelado'], cashiers.map((c) => [c.cashier, c.total, c.tickets, c.cancelled, c.cancelled_amount]));
+  };
+  // Excel del periodo: todo lo de Reportes más el detalle de ventas, movimientos, cortes e inventario
+  const xlsxBtn = el.querySelector<HTMLButtonElement>('#xlsx')!;
+  xlsxBtn.onclick = async () => {
+    xlsxBtn.disabled = true;
+    try {
+      const [f, t] = rangeOf(from.value, to.value);
+      const [sales, moves, cuts, products] = await Promise.all([
+        listAllSales(ctx.business.id, f, t), listMovements(ctx.business.id, f, t, { limit: 20000 }),
+        listCuts(ctx.business.id, f, t), listProducts(ctx.business.id)]);
+      const pay = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}: ${v}`).join(', ');
+      downloadXlsx(`reporte-${ctx.business.name || ctx.business.license_key}-${from.value}-a-${to.value}.xlsx`, [
+        { name: 'Por día', header: ['Día', 'Ventas', 'Tickets', 'Ganancia', 'Canceladas'], rows: days.map((d) => [d.day, d.total, d.tickets, d.profit, d.cancelled]) },
+        { name: 'Por producto', header: ['Código de barras', 'Producto', 'Piezas', 'Importe', 'Costo', 'Ganancia', 'Tickets'],
+          rows: [...prods].sort((a, b) => b.amount - a.amount).map((p) => [p.barcode, p.name, p.qty, p.amount, p.cost, +(p.amount - p.cost).toFixed(2), p.tickets]) },
+        { name: 'Por cajero', header: ['Cajero', 'Ventas', 'Tickets', 'Canceladas', 'Importe cancelado'], rows: cashiers.map((c) => [c.cashier, c.total, c.tickets, c.cancelled, c.cancelled_amount]) },
+        { name: 'Ventas', header: ['Fecha', 'Folio', 'Cajero', 'Forma de pago', 'Desglose', 'Total', 'Ganancia', 'Cancelada', 'Canceló'],
+          rows: sales.map((s) => [fmtDateTime(s.ts), s.id, s.cashier, s.payment_method, pay(s.payment_breakdown), s.total, s.profit, s.cancelled, s.cancelled_by]) },
+        { name: 'Movimientos', header: ['Fecha', 'Tipo', 'Producto', 'Cantidad', 'Antes', 'Después', 'Costo total', 'Motivo', 'Usuario', 'Anulado'],
+          rows: moves.map((m) => [fmtDateTime(m.ts), moveLabel(m.type), m.product_name, m.quantity, m.stock_before, m.stock_after, m.total_cost, m.reason, m.user_name, !!m.voided_at]) },
+        { name: 'Cortes', header: ['Fecha', 'Tipo', 'Cajero', 'Fondo inicial', 'Total', 'Tickets', 'Formas de pago'],
+          rows: cuts.map((c) => [fmtDateTime(c.ts), c.cut_type === 'z' ? 'Corte Z' : c.cut_type === 'x' ? 'Corte X' : 'Apertura', c.cashier, c.opening_amount, c.total, c.sales_count, pay(c.payments)]) },
+        { name: 'Inventario hoy', header: ['Código de barras', 'Nombre', 'Categoría', 'Costo', 'Precio', 'Existencia', 'Mínimo', 'Activo'],
+          rows: products.map((p) => [p.barcode, p.name, p.category, p.cost, p.price, p.stock, p.min_stock, p.active !== false]) },
+      ]);
+    } catch (e) {
+      toast(`No se pudo armar el Excel: ${(e as Error).message}`);
+    }
+    xlsxBtn.disabled = false;
   };
   await load();
 }
