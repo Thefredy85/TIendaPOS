@@ -580,6 +580,29 @@ async function main() {
       const chars = await page.evaluate(() => Object.keys(localStorage).reduce((a, k) => a + (localStorage.getItem(k) || '').length, 0));
       check(chars < 1000000, '10) la copia del navegador quedó pequeña (se borró la vieja)', `${chars} caracteres`);
     }
+    // 11) Orden del panel web (Fase 4): cambia datos, la pantalla se entera y la existencia no se mueve
+    if (in10) {
+      await page.evaluate(() => pollRemoteChanges()); // linea base
+      await tapProduct(page, 'BEB-0001');
+      const before = await call('__test_get_product', { sku: 'BEB-0001' });
+      const other = await call('__test_get_product', { sku: 'P1759000000000ABC' });
+      const sales = await page.evaluate(() => state.sales.length);
+      const next = Number(before.price) + 5;
+      const order = (after, was) => ({ id: 'c1', type: 'product_edit', payload: { internal_id: 'BEB-0001', before: was, after } });
+      const applied = await call('__test_apply_command', order({ price: next, cost: 3 }, { price: before.price, cost: before.cost }));
+      check(applied.status === 'aplicado', '11) la caja aplica la orden del panel', JSON.stringify(applied));
+      const rejected = await call('__test_apply_command', order({ stock: 500 }, { stock: before.stock }));
+      check(rejected.status === 'rechazado', '11) una orden que pide cambiar la existencia se rechaza');
+      await page.evaluate(() => pollRemoteChanges());
+      const after = await call('__test_get_product', { sku: 'BEB-0001' });
+      check(Number(after.price) === next && Number(after.cost) === 3, '11) precio y costo nuevos en la base');
+      check(after.stock === before.stock, '11) la existencia no cambia con la orden', `${before.stock} -> ${after.stock}`);
+      check(after.name === before.name && after.barcode === before.barcode && after.sku === before.sku, '11) nombre, código e identificador intactos');
+      check(JSON.stringify(await call('__test_get_product', { sku: 'P1759000000000ABC' })) === JSON.stringify(other), '11) los demás productos quedan intactos');
+      check(await page.evaluate((n) => state.products.find((p) => p.sku === 'BEB-0001')?.price === n, next), '11) la pantalla toma el precio nuevo');
+      check(await page.evaluate((n) => state.cart.find((l) => l.sku === 'BEB-0001')?.price === n, next), '11) el ticket en curso se actualiza');
+      check(await page.evaluate((n) => state.sales.length === n, sales), '11) las ventas quedan intactas');
+    }
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
   } finally {

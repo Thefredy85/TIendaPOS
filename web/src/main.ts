@@ -15,6 +15,7 @@ import { renderMovimientos } from './views/movimientos';
 import { renderReportes } from './views/reportes';
 import { renderUsuarios } from './views/usuarios';
 import { loadAlerts, renderAlertas } from './views/alertas';
+import { renderModificados } from './views/modificados';
 
 export interface Ctx {
   business: Business;
@@ -40,6 +41,7 @@ const ROUTES: Record<string, { title: string; icon: string; view: View; superOnl
   ventas: { title: 'Ventas', icon: 'receipt', view: renderVentas },
   cortes: { title: 'Cortes', icon: 'calculator', view: renderCortes },
   inventario: { title: 'Inventario', icon: 'package', view: renderInventario },
+  modificados: { title: 'Modificados', icon: 'history', view: renderModificados },
   movimientos: { title: 'Movimientos', icon: 'arrow-left-right', view: renderMovimientos },
   reportes: { title: 'Reportes', icon: 'chart-column', view: renderReportes },
   usuarios: { title: 'Usuarios', icon: 'users', view: renderUsuarios },

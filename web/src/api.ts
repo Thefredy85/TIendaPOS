@@ -111,7 +111,7 @@ export async function listCuts(businessId: string, from: Date, to: Date): Promis
 // Avisa cuando cambian ventas, cortes o cajas del negocio (Supabase Realtime respeta RLS).
 export function watchBusiness(businessId: string, onChange: (table: string) => void): () => void {
   const ch = sb.channel(`negocio-${businessId}`);
-  for (const table of ['pos_sales', 'pos_cash_cuts', 'pos_devices', 'pos_inventory_movements']) {
+  for (const table of ['pos_sales', 'pos_cash_cuts', 'pos_devices', 'pos_inventory_movements', 'pos_commands']) {
     ch.on('postgres_changes', { event: '*', schema: 'public', table, filter: `business_id=eq.${businessId}` }, () => onChange(table));
   }
   ch.subscribe();
@@ -183,6 +183,25 @@ export async function listProducts(businessId: string): Promise<Product[]> {
     out.push(...rows.map((p) => ({ ...p, cost: n(p.cost), price: n(p.price), stock: n(p.stock), min_stock: n(p.min_stock) })) as Product[]);
     if (rows.length < 1000) return out;
   }
+}
+
+// ---------- cambios desde la web (órdenes que aplica la caja) ----------
+
+export type ProductFields = Partial<{ cost: number; price: number; name: string; category: string; min_stock: number }>;
+export interface RemoteChange {
+  id: string; type: string; status: 'pendiente' | 'aplicado' | 'rechazado' | 'cancelado';
+  payload: { internal_id: string; before: ProductFields; after: ProductFields; undo_of?: string };
+  created_at: string; applied_at: string | null; result: string | null; email: string | null;
+}
+
+export async function editProduct(businessId: string, internalId: string, before: ProductFields, after: ProductFields, undoOf: string | null = null): Promise<string> {
+  return check(await sb.rpc('panel_edit_product', { p_business_id: businessId, p_internal_id: internalId, p_before: before, p_after: after, p_undo_of: undoOf })) as string;
+}
+export async function cancelChange(commandId: string): Promise<boolean> {
+  return check(await sb.rpc('panel_cancel_command', { p_command_id: commandId })) as boolean;
+}
+export async function recentChanges(businessId: string, days = 30): Promise<RemoteChange[]> {
+  return check(await sb.rpc('panel_recent_changes', { p_business_id: businessId, p_days: days })) as RemoteChange[];
 }
 
 // ---------- movimientos ----------

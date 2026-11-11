@@ -1894,6 +1894,7 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "sync_batch" => op_sync_batch(conn, sessions, token, payload),
         "history" => op_history(conn, sessions, token, payload),
         "license_status" => Ok(license_status(conn)),
+        "remote_sync" => op_remote_sync(conn, sessions, token, payload),
         "apply_unlock_code" => op_apply_unlock_code(conn, sessions, token, payload),
         "inventory_diagnostics" => op_inventory_diagnostics(conn, sessions, token, payload),
         "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
@@ -2233,6 +2234,116 @@ fn with_db<T>(app: &tauri::AppHandle, f: impl FnOnce(&Connection) -> T) -> Optio
 
 // Un ciclo completo: registrar si hace falta, latido si toca y vaciar la cola.
 // Devuelve Ok si se pudo hablar con la nube.
+// ---------- ordenes desde el panel web (Fase 4) ----------
+// La web nunca escribe en esta base: deja una orden en la nube, esta caja la baja, la
+// valida y la aplica. Solo se editan datos del producto; la existencia NUNCA.
+
+// (campo en la orden, campo local, nombre para mostrar)
+const REMOTE_PRODUCT_FIELDS: [(&str, &str, &str); 5] = [
+    ("cost", "cost", "costo"),
+    ("price", "price", "precio"),
+    ("name", "name", "nombre"),
+    ("category", "category", "categoría"),
+    ("min_stock", "minStock", "mínimo"),
+];
+
+fn remote_field_equal(local_key: &str, current: &Value, wanted: Option<&Value>) -> bool {
+    let cur = current.get(local_key);
+    if matches!(local_key, "name" | "category") {
+        clean_text(cur) == clean_text(wanted)
+    } else {
+        (num_of(cur) - num_of(wanted)).abs() < 0.005
+    }
+}
+
+// Devuelve Ok(true) si cambio el producto y Ok(false) si la orden ya estaba aplicada
+// (se fue la luz o el internet despues de aplicar y antes de avisar a la nube).
+fn apply_product_edit(conn: &Connection, payload: &Value) -> Result<bool, String> {
+    let sku = clean_text(payload.get("internal_id"));
+    let after = payload.get("after").and_then(|v| v.as_object()).filter(|m| !m.is_empty())
+        .ok_or("La orden no trae cambios")?;
+    let before = payload.get("before").cloned().unwrap_or_else(|| json!({}));
+    let fields: Vec<_> = after.keys().map(|k| REMOTE_PRODUCT_FIELDS.iter().find(|f| f.0 == k).ok_or_else(|| format!("Campo no permitido: {}", k))).collect::<Result<_, _>>()?;
+    let current = get_item(conn, "products", &sku).ok_or("El producto ya no existe en la caja")?;
+
+    if fields.iter().all(|f| remote_field_equal(f.1, &current, after.get(f.0))) {
+        return Ok(false);
+    }
+    // Nunca se pisa lo que la tienda cambio mientras la orden esperaba
+    for f in &fields {
+        if !remote_field_equal(f.1, &current, before.get(f.0)) {
+            return Err(format!("El {} cambió en la caja mientras el cambio esperaba", f.2));
+        }
+    }
+    let mut patch = serde_json::Map::new();
+    for f in &fields {
+        let v = after.get(f.0).unwrap();
+        if matches!(f.1, "name" | "category") {
+            let text = clean_text(Some(v));
+            if text.is_empty() { return Err(format!("El {} no puede quedar vacío", f.2)); }
+            if f.1 == "category" && !list_items(conn, "categories").iter().any(|c| clean_text(c.get("name")).to_lowercase() == text.to_lowercase()) {
+                return Err("Esa categoría no existe en la caja".into());
+            }
+            patch.insert(f.1.to_string(), json!(text));
+        } else {
+            let n = v.as_f64().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("El {} no es válido", f.2))?;
+            patch.insert(f.1.to_string(), json!(n));
+            if f.1 == "cost" || f.1 == "price" {
+                let (iva, without) = iva_parts(n);
+                let (k_iva, k_wo) = if f.1 == "cost" { ("costIva", "costWithoutIva") } else { ("priceIva", "priceWithoutIva") };
+                patch.insert(k_iva.to_string(), json!(iva));
+                patch.insert(k_wo.to_string(), json!(without));
+            }
+        }
+    }
+    patch_item(conn, "products", &sku, &Value::Object(patch))?;
+    Ok(true)
+}
+
+// Aplica una orden y dice como le fue: ("aplicado" | "rechazado", motivo)
+fn apply_command(conn: &Connection, cmd: &Value) -> (&'static str, String) {
+    let payload = cmd.get("payload").cloned().unwrap_or_else(|| json!({}));
+    let outcome = match clean_text(cmd.get("type")).as_str() {
+        "product_edit" => {
+            let mut changed = false;
+            all_or_nothing(conn, || { changed = apply_product_edit(conn, &payload)?; Ok(()) }).map(|_| changed)
+        }
+        other => Err(format!("Esta versión de la app no conoce la orden \"{}\"", other)),
+    };
+    match outcome {
+        Ok(changed) => {
+            if changed {
+                let seq = cloud_state(conn).get("remoteSeq").and_then(|v| v.as_i64()).unwrap_or(0);
+                save_cloud_state(conn, &json!({"remoteSeq": seq + 1}));
+            }
+            ("aplicado", String::new())
+        }
+        Err(e) => ("rechazado", e),
+    }
+}
+
+// La pantalla pregunta seguido; si el panel cambio algo le entregan los productos nuevos.
+fn op_remote_sync(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    current_user(true, conn, sessions, token)?;
+    let seq = cloud_state(conn).get("remoteSeq").and_then(|v| v.as_i64()).unwrap_or(0);
+    let since = payload.get("since").and_then(|v| v.as_i64());
+    if since == Some(seq) {
+        return Ok(json!({"ok": true, "seq": seq}));
+    }
+    Ok(json!({"ok": true, "seq": seq, "products": list_items(conn, "products")}))
+}
+
+// Baja las ordenes pendientes, las aplica en orden y avisa el resultado. Si el aviso
+// falla, la orden sigue pendiente y al repetirla se detecta que ya estaba aplicada.
+fn pull_and_apply_commands(app: &tauri::AppHandle, token: &str) -> Result<(), String> {
+    let cmds = rpc_call("pos_pull_commands", &json!({"p_token": token, "p_limit": 50}))?;
+    for cmd in cmds.as_array().cloned().unwrap_or_default() {
+        let (status, result) = with_db(app, |conn| apply_command(conn, &cmd)).ok_or("Error de base de datos local")?;
+        rpc_call("pos_ack_command", &json!({"p_token": token, "p_command_id": clean_text(cmd.get("id")), "p_status": status, "p_result": result}))?;
+    }
+    Ok(())
+}
+
 fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), String> {
     let _one_at_a_time = CLOUD_STEP.lock().map_err(|_| "ocupado".to_string())?;
     let app_version = app.package_info().version.to_string();
@@ -2325,6 +2436,14 @@ fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), Strin
                 save_cloud_state(conn, &json!({"initialLoadDone": true, "initialLoadAt": now_iso()}));
             }
         });
+    }
+
+    // 3b. ordenes del panel (antes de enviar, para que el cambio suba en este mismo ciclo).
+    // Con el servicio suspendido se quedan esperando, igual que un cambio hecho en la caja.
+    if with_db(app, |conn| ensure_not_blocked(conn).is_ok()).unwrap_or(false) {
+        if let Err(e) = pull_and_apply_commands(app, &token) {
+            with_db(app, |conn| save_cloud_state(conn, &json!({"lastError": e})));
+        }
     }
 
     // 4. vaciar la cola por lotes
@@ -2449,6 +2568,97 @@ mod tests {
     }
     fn count(conn: &Connection) -> usize { list_items(conn, "products").len() }
     fn stock_of(conn: &Connection, sku: &str) -> f64 { num_of(get_item(conn, "products", sku).unwrap().get("stock")) }
+
+    // ---------- ordenes del panel (Fase 4) ----------
+    fn orden(sku: &str, before: Value, after: Value) -> Value {
+        json!({"id": "c1", "type": "product_edit", "payload": {"internal_id": sku, "before": before, "after": after}})
+    }
+
+    #[test]
+    fn orden_del_panel_cambia_datos_y_jamas_la_existencia() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let antes = get_item(&conn, "products", "BEB-0001").unwrap();
+        let cola = outbox_count(&conn);
+        let (st, why) = apply_command(&conn, &orden("BEB-0001", json!({"price": 12.0, "cost": antes["cost"], "min_stock": 1, "name": "Agua"}), json!({"price": 15.5, "cost": 7.25, "min_stock": 4, "name": "Agua 600"})));
+        assert_eq!((st, why.as_str()), ("aplicado", ""));
+        let p = get_item(&conn, "products", "BEB-0001").unwrap();
+        assert_eq!(num_of(p.get("price")), 15.5);
+        assert_eq!(num_of(p.get("cost")), 7.25);
+        assert_eq!(num_of(p.get("minStock")), 4.0);
+        assert_eq!(clean_text(p.get("name")), "Agua 600");
+        // el IVA desglosado se mantiene coherente, igual que al guardar desde la caja
+        assert_eq!(num_of(p.get("priceIva")), iva_parts(15.5).0);
+        assert_eq!(num_of(p.get("costWithoutIva")), iva_parts(7.25).1);
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+        assert_eq!(p["barcode"], antes["barcode"]);
+        assert_eq!(p["sku"], antes["sku"]);
+        assert!(outbox_count(&conn) >= cola, "el cambio debe subir a la nube");
+    }
+
+    #[test]
+    fn orden_con_existencia_o_campo_ajeno_se_rechaza_entera() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        for campo in ["stock", "barcode", "sku", "active"] {
+            let (st, why) = apply_command(&conn, &orden("BEB-0001", json!({"price": 12.0}), json!({"price": 20.0, campo: 99})));
+            assert_eq!(st, "rechazado", "{}", campo);
+            assert!(why.contains("no permitido"), "{}", why);
+        }
+        let p = get_item(&conn, "products", "BEB-0001").unwrap();
+        assert_eq!(num_of(p.get("price")), 12.0);
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+    }
+
+    #[test]
+    fn orden_no_pisa_lo_que_cambio_en_la_caja() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let (st, why) = apply_command(&conn, &orden("BEB-0001", json!({"price": 11.0}), json!({"price": 20.0})));
+        assert_eq!(st, "rechazado");
+        assert!(why.contains("precio"), "{}", why);
+        assert_eq!(num_of(get_item(&conn, "products", "BEB-0001").unwrap().get("price")), 12.0);
+    }
+
+    #[test]
+    fn orden_repetida_no_cuenta_dos_veces() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let c = orden("BEB-0001", json!({"price": 12.0}), json!({"price": 20.0}));
+        assert_eq!(apply_command(&conn, &c).0, "aplicado");
+        let seq = cloud_state(&conn)["remoteSeq"].as_i64();
+        assert_eq!(apply_command(&conn, &c).0, "aplicado", "ya aplicada: se confirma sin error");
+        assert_eq!(cloud_state(&conn)["remoteSeq"].as_i64(), seq);
+    }
+
+    #[test]
+    fn orden_valida_producto_valores_y_categoria() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        dispatch("save_catalog", &json!({"kind":"category","name":"Bebidas"}), &t, &conn, &mut s).unwrap();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Botanas"}), &t, &conn, &mut s).unwrap();
+        assert!(apply_command(&conn, &orden("NO-EXISTE", json!({"price": 1.0}), json!({"price": 2.0}))).1.contains("ya no existe"));
+        assert_eq!(apply_command(&conn, &orden("BEB-0001", json!({"price": 12.0}), json!({"price": -1.0}))).0, "rechazado");
+        assert_eq!(apply_command(&conn, &orden("BEB-0001", json!({"name": "Agua"}), json!({"name": "   "}))).0, "rechazado");
+        assert!(apply_command(&conn, &orden("BEB-0001", json!({"category": "Bebidas"}), json!({"category": "Inventada"}))).1.contains("no existe"));
+        assert_eq!(apply_command(&conn, &orden("BEB-0001", json!({"category": "Bebidas"}), json!({"category": "Botanas"}))).0, "aplicado");
+        assert_eq!(apply_command(&conn, &json!({"type": "algo_nuevo", "payload": {}})).0, "rechazado");
+    }
+
+    #[test]
+    fn remote_sync_entrega_productos_solo_si_hubo_cambios() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let r = dispatch("remote_sync", &json!({}), &t, &conn, &mut s).unwrap();
+        let seq = r["seq"].as_i64().unwrap();
+        let r = dispatch("remote_sync", &json!({"since": seq}), &t, &conn, &mut s).unwrap();
+        assert!(r.get("products").is_none());
+        apply_command(&conn, &orden("BEB-0001", json!({"price": 12.0}), json!({"price": 20.0})));
+        let r = dispatch("remote_sync", &json!({"since": seq}), &t, &conn, &mut s).unwrap();
+        assert_eq!(r["seq"].as_i64().unwrap(), seq + 1);
+        assert_eq!(num_of(r["products"][0].get("price")), 20.0);
+        assert!(dispatch("remote_sync", &json!({}), "token-falso", &conn, &mut s).is_err());
+    }
 
     #[test]
     fn productos_nuevos_no_sobrescriben_a_los_existentes() {
@@ -3162,6 +3372,10 @@ mod tests {
                     let (c, s, _) = fresh();
                     conn = c; sessions = s;
                     json!({"ok": true})
+                }
+                "__test_apply_command" => {
+                    let (status, result) = apply_command(&conn, &payload);
+                    json!({"ok": true, "status": status, "result": result})
                 }
                 "__test_put_product" => {
                     let sku = clean_text(payload.get("sku"));
