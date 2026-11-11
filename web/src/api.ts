@@ -205,6 +205,8 @@ export interface RemotePayload {
   internal_id: string; before: ProductFields; after: ProductFields; undo_of?: string;
   type?: MoveType; quantity?: number; reason?: string; by?: string; active?: boolean;
   barcode?: string; name?: string; category?: string; cost?: number; price?: number; min_stock?: number;
+  // catalog_save
+  kind?: CatalogKind; id?: string; old_name?: string; description?: string; abbreviation?: string; phone?: string; notes?: string;
 }
 export interface RemoteChange {
   id: string; type: string; status: 'pendiente' | 'aplicado' | 'rechazado' | 'cancelado';
@@ -223,6 +225,25 @@ export async function createProduct(businessId: string, p: NewProduct): Promise<
   return check(await sb.rpc('panel_create_product', {
     p_business_id: businessId, p_barcode: p.barcode, p_name: p.name, p_category: p.category,
     p_cost: p.cost, p_price: p.price, p_min_stock: p.min_stock,
+  })) as string;
+}
+
+// ---------- catálogos (v0.2.16): los sube la caja; el panel deja órdenes ----------
+
+export type CatalogKind = 'category' | 'unit' | 'supplier' | 'presentation';
+export interface Catalog {
+  kind: CatalogKind; id: string; name: string; active: boolean; sort_order: number | null;
+  data: Partial<Record<'description' | 'abbreviation' | 'phone' | 'notes', string>>;
+}
+export async function listCatalogs(businessId: string): Promise<Catalog[]> {
+  const rows = check(await sb.from('pos_catalogs').select('kind, id, name, active, sort_order, data')
+    .eq('business_id', businessId).is('deleted_at', null).order('kind').order('sort_order').order('name').range(0, 4999));
+  return rows.map((c) => ({ ...c, sort_order: n(c.sort_order), data: (c.data ?? {}) as Catalog['data'] })) as Catalog[];
+}
+export async function saveCatalog(businessId: string, kind: CatalogKind, id: string | null, oldName: string | null,
+  name: string, active: boolean | null, data: Catalog['data']): Promise<string> {
+  return check(await sb.rpc('panel_save_catalog', {
+    p_business_id: businessId, p_kind: kind, p_id: id, p_old_name: oldName, p_name: name, p_active: active, p_data: data,
   })) as string;
 }
 

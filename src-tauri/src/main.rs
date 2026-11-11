@@ -320,7 +320,14 @@ fn delete_item(conn: &Connection, store: &str, id: &str) -> Result<(), String> {
 // sin internet se envian una sola vez. `version` sube con cada cambio: un registro
 // solo sale de la cola si no cambio mientras se enviaba.
 
-const SYNC_STORES: [&str; 6] = ["products", "sales", "moves", "cash_cuts", "users", "role_permissions"];
+const SYNC_STORES: [&str; 10] = [
+    "products", "sales", "moves", "cash_cuts", "users", "role_permissions",
+    // catalogos (v0.2.16): el panel los muestra y los puede editar con ordenes
+    "categories", "units", "suppliers", "presentations",
+];
+const CATALOG_STORES: [(&str, &str); 4] = [
+    ("categories", "category"), ("units", "unit"), ("suppliers", "supplier"), ("presentations", "presentation"),
+];
 
 fn outbox_enqueue(conn: &Connection, store: &str, id: &str, tombstone: Option<&Value>) -> Result<(), String> {
     if !SYNC_STORES.contains(&store) {
@@ -338,6 +345,19 @@ fn outbox_enqueue(conn: &Connection, store: &str, id: &str, tombstone: Option<&V
 
 fn outbox_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).unwrap_or(0)
+}
+
+// Cajas que ya hicieron su carga inicial antes de la v0.2.16: suben sus catalogos una vez.
+// Solo LEE los catalogos; no cambia ninguno.
+fn outbox_enqueue_catalogs(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO outbox (store, id, version) SELECT store, id, 1 FROM store_data
+         WHERE store IN ('categories','units','suppliers','presentations') ON CONFLICT(store, id) DO NOTHING",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    wake_cloud_worker(false);
+    Ok(())
 }
 
 // Carga inicial: encola todo lo que hay. Solo LEE los datos; no cambia ninguno.
@@ -1213,6 +1233,53 @@ fn op_history(conn: &Connection, sessions: &mut HashMap<String, Session>, token:
     Ok(json!({"ok": true, "kind": kind, "rows": rows}))
 }
 
+// Kardex de un producto (v0.2.16, solo lectura): todos sus movimientos del periodo
+// (ventas, cancelaciones, entradas, salidas, mermas, conteos y los del panel), del mas
+// nuevo al mas viejo, con totales. Mismos permisos que el historial de movimientos.
+fn op_product_kardex(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
+    let user = current_user(true, conn, sessions, token)?.unwrap();
+    let role = clean_text(user.get("role"));
+    let perms = read_role_permissions(conn);
+    let sees_ops = role == "admin" || role == "encargado" || has_permission(&perms, &role, "movements") || has_permission(&perms, &role, "counts");
+    if !sees_ops { return Err("No autorizado".into()); }
+    let sku = clean_text(payload.get("sku"));
+    if sku.is_empty() { return Err("Elige un producto".into()); }
+    let product = get_item(conn, "products", &sku);
+    let from = clean_text(payload.get("from"));
+    let to = clean_text(payload.get("to"));
+    let mut sql = String::from("SELECT data FROM store_data WHERE store = 'moves' AND json_extract(data, '$.sku') = ?1");
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&sku];
+    if !from.is_empty() { sql.push_str(&format!(" AND json_extract(data, '$.timestamp') >= ?{}", args.len() + 1)); args.push(&from); }
+    if !to.is_empty() { sql.push_str(&format!(" AND json_extract(data, '$.timestamp') < ?{}", args.len() + 1)); args.push(&to); }
+    let mut rows: Vec<Value> = match conn.prepare(&sql) {
+        Ok(mut stmt) => match stmt.query_map(args.as_slice(), |row| row.get::<_, String>(0)) {
+            Ok(r) => r.filter_map(|r| r.ok()).filter_map(|s| serde_json::from_str::<Value>(&s).ok()).collect(),
+            Err(e) => return Err(e.to_string()),
+        },
+        Err(e) => return Err(e.to_string()),
+    };
+    rows.sort_by(|a, b| clean_text(b.get("timestamp")).cmp(&clean_text(a.get("timestamp"))).then(clean_text(b.get("id")).cmp(&clean_text(a.get("id")))));
+    let (mut entradas, mut salidas, mut ventas, mut devoluciones) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for m in &rows {
+        let q = num_of(m.get("quantity"));
+        match clean_text(m.get("type")).as_str() {
+            "venta" => ventas -= q,
+            "devolucion_venta" => devoluciones += q,
+            _ if q > 0.0 => entradas += q,
+            _ => salidas -= q,
+        }
+    }
+    Ok(json!({
+        "ok": true, "sku": sku,
+        "product": product.map(|p| json!({
+            "sku": sku, "name": clean_text(p.get("name")), "barcode": clean_text(p.get("barcode")),
+            "stock": num_of(p.get("stock")), "category": clean_text(p.get("category")), "active": not_false(p.get("active"))
+        })),
+        "rows": rows,
+        "totals": {"entradas": entradas, "salidas": salidas, "ventas": ventas, "devoluciones": devoluciones}
+    }))
+}
+
 // Diagnostico de inventario (solo lectura): codigos duplicados, existencias negativas
 // o en cero, y ventas cuyo descuento no tiene su movimiento registrado.
 fn op_inventory_diagnostics(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
@@ -1895,6 +1962,7 @@ fn dispatch(op: &str, payload: &Value, token: &str, conn: &Connection, sessions:
         "history" => op_history(conn, sessions, token, payload),
         "license_status" => Ok(license_status(conn)),
         "remote_sync" => op_remote_sync(conn, sessions, token, payload),
+        "product_kardex" => op_product_kardex(conn, sessions, token, payload),
         "apply_unlock_code" => op_apply_unlock_code(conn, sessions, token, payload),
         "inventory_diagnostics" => op_inventory_diagnostics(conn, sessions, token, payload),
         "open_cash_register" => op_open_cash_register(conn, sessions, token, payload),
@@ -2078,6 +2146,20 @@ fn cloud_product(p: &Value) -> Value {
     })
 }
 
+// Catalogo para la nube: lo comun en columnas y lo propio de cada tipo en `data`
+fn cloud_catalog(kind: &str, id: &str, c: &Value) -> Value {
+    let mut data = json!({});
+    for k in ["description", "abbreviation", "phone", "notes"] {
+        if let Some(v) = c.get(k) { data[k] = json!(clean_text(Some(v))); }
+    }
+    json!({
+        "kind": kind, "id": id, "name": clean_text(c.get("name")),
+        "active": not_false(c.get("active")),
+        "sort_order": c.get("sortOrder").and_then(|v| v.as_f64()),
+        "data": data
+    })
+}
+
 fn cloud_user(u: &Value) -> Value {
     json!({
         "username": clean_text(u.get("username")),
@@ -2173,7 +2255,7 @@ fn build_push_batch(conn: &Connection, limit: usize) -> (Value, Vec<(String, Str
         }
     }
     let mut batch = json!({
-        "at": now_iso(), "products": [], "sales": [], "movements": [], "cash_cuts": [], "users": []
+        "at": now_iso(), "products": [], "sales": [], "movements": [], "cash_cuts": [], "users": [], "catalogs": []
     });
     let push = |batch: &mut Value, kind: &str, row: Value| {
         if let Some(a) = batch.get_mut(kind).and_then(|v| v.as_array_mut()) { a.push(row); }
@@ -2195,7 +2277,11 @@ fn build_push_batch(conn: &Connection, limit: usize) -> (Value, Vec<(String, Str
             "cash_cuts" if !deleted => push(&mut batch, "cash_cuts", cloud_cut(&record)),
             // permisos efectivos: los guardados o, si nunca se cambiaron, los de fabrica
             "role_permissions" => { batch["role_permissions"] = read_role_permissions(conn); }
-            _ => {}
+            st => {
+                if let Some((_, kind)) = CATALOG_STORES.iter().find(|(s, _)| *s == st) {
+                    push(&mut batch, "catalogs", mark(cloud_catalog(kind, id, &record)));
+                }
+            }
         }
     }
     (batch, keys.into_iter().map(|(s, i, v, _)| (s, i, v)).collect())
@@ -2390,6 +2476,87 @@ fn apply_product_create(conn: &Connection, cmd_id: &str, payload: &Value) -> Res
     Ok(true)
 }
 
+// Campo del producto que guarda el nombre de cada catalogo
+fn catalog_product_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "category" => Some("category"),
+        "unit" => Some("unit"),
+        "supplier" => Some("supplier"),
+        "presentation" => Some("presentation"),
+        _ => None,
+    }
+}
+
+// Alta o edicion de un catalogo desde el panel. Al cambiar el nombre, tambien cambia
+// ESE campo (y solo ese) en los productos que lo usan; precio, codigo y existencia no
+// se tocan. Todo dentro de all_or_nothing: o queda el catalogo con sus productos o nada.
+fn apply_catalog_save(conn: &Connection, cmd_id: &str, payload: &Value) -> Result<bool, String> {
+    if cmd_id.is_empty() { return Err("La orden no trae identificador".into()); }
+    let kind = clean_text(payload.get("kind"));
+    let store = catalog_store(&kind).ok_or("Catálogo no reconocido")?;
+    let field = catalog_product_field(&kind).ok_or("Catálogo no reconocido")?;
+    let name = clean_text(payload.get("name"));
+    if name.is_empty() { return Err("El nombre no puede quedar vacío".into()); }
+    if name.chars().count() > 100 { return Err("El nombre es demasiado largo".into()); }
+    let rows = list_items(conn, store);
+    // la orden ya se aplico (se fue el internet antes de avisar a la nube)
+    if rows.iter().any(|r| clean_text(r.get("panelCmd")) == cmd_id) { return Ok(false); }
+    let id = clean_text(payload.get("id"));
+    let current = if id.is_empty() { None } else { Some(get_item(conn, store, &id).ok_or("Ese registro ya no existe en la caja")?) };
+    if let Some(dup) = rows.iter().find(|r| clean_text(r.get("name")).to_lowercase() == name.to_lowercase() && clean_text(r.get("id")) != id) {
+        return Err(format!("Ya existe \"{}\" en ese catálogo de la caja", clean_text(dup.get("name"))));
+    }
+    let old_name = current.as_ref().map(|c| clean_text(c.get("name"))).unwrap_or_default();
+    if current.is_some() {
+        let expected = clean_text(payload.get("old_name"));
+        if !expected.is_empty() && expected != old_name {
+            return Err(format!("El nombre cambió en la caja (ahora es \"{}\"); vuelve a intentarlo", old_name));
+        }
+    }
+    let mut record = current.clone().unwrap_or_else(|| json!({}));
+    let new_id = if id.is_empty() {
+        let base = slug(&name);
+        let base = if base.is_empty() { "catalogo".to_string() } else { base };
+        if get_item(conn, store, &base).is_some() {
+            let hex: String = cmd_id.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+            format!("{}-{}", base, hex.to_lowercase())
+        } else { base }
+    } else { id.clone() };
+    record["id"] = json!(new_id);
+    record["name"] = json!(name);
+    if let Some(a) = payload.get("active").and_then(|v| v.as_bool()) { record["active"] = json!(a); }
+    else if current.is_none() { record["active"] = json!(true); }
+    if record.get("sortOrder").is_none() { record["sortOrder"] = json!((rows.len() + 1) as f64); }
+    let extras: &[&str] = match kind.as_str() {
+        "category" | "presentation" => &["description"],
+        "unit" => &["abbreviation"],
+        "supplier" => &["phone", "notes"],
+        _ => &[],
+    };
+    for k in extras {
+        if let Some(v) = payload.get(*k) {
+            let t = clean_text(Some(v));
+            if t.chars().count() > 300 { return Err("Un dato es demasiado largo".into()); }
+            record[*k] = json!(t);
+        }
+    }
+    if kind == "unit" && clean_text(record.get("abbreviation")).is_empty() { record["abbreviation"] = json!(name); }
+    record["panelCmd"] = json!(cmd_id);
+    record["panelBy"] = json!(panel_user(payload));
+    create_item(conn, store, &new_id, &record)?;
+    // cambio de nombre: los productos que usaban el nombre viejo pasan al nuevo (solo ese campo)
+    if current.is_some() && !old_name.is_empty() && old_name != name {
+        for p in list_items(conn, "products") {
+            if clean_text(p.get(field)) == old_name {
+                let sku = clean_text(p.get("sku"));
+                if sku.is_empty() { continue; }
+                patch_item(conn, "products", &sku, &json!({ field: name }))?;
+            }
+        }
+    }
+    Ok(true)
+}
+
 // Aplica una orden y dice como le fue: ("aplicado" | "rechazado", motivo)
 fn apply_command(conn: &Connection, cmd: &Value) -> (&'static str, String) {
     let payload = cmd.get("payload").cloned().unwrap_or_else(|| json!({}));
@@ -2400,6 +2567,7 @@ fn apply_command(conn: &Connection, cmd: &Value) -> (&'static str, String) {
         "stock_move" => all_or_nothing(conn, || { changed = apply_stock_move(conn, &cmd_id, &payload)?; Ok(()) }),
         "product_active" => all_or_nothing(conn, || { changed = apply_product_active(conn, &payload)?; Ok(()) }),
         "product_create" => all_or_nothing(conn, || { changed = apply_product_create(conn, &cmd_id, &payload)?; Ok(()) }),
+        "catalog_save" => all_or_nothing(conn, || { changed = apply_catalog_save(conn, &cmd_id, &payload)?; Ok(()) }),
         other => Err(format!("Esta versión de la app no conoce la orden \"{}\"", other)),
     }.map(|_| changed);
     match outcome {
@@ -2422,7 +2590,11 @@ fn op_remote_sync(conn: &Connection, sessions: &mut HashMap<String, Session>, to
     if since == Some(seq) {
         return Ok(json!({"ok": true, "seq": seq}));
     }
-    Ok(json!({"ok": true, "seq": seq, "products": list_items(conn, "products")}))
+    Ok(json!({
+        "ok": true, "seq": seq, "products": list_items(conn, "products"),
+        "categories": list_items(conn, "categories"), "units": list_items(conn, "units"),
+        "suppliers": list_items(conn, "suppliers"), "presentations": list_items(conn, "presentations")
+    }))
 }
 
 // Baja las ordenes pendientes, las aplica en orden y avisa el resultado. Si el aviso
@@ -2526,6 +2698,15 @@ fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), Strin
         with_db(app, |conn| {
             if outbox_enqueue_all(conn).is_ok() {
                 save_cloud_state(conn, &json!({"initialLoadDone": true, "initialLoadAt": now_iso()}));
+            }
+        });
+    }
+
+    // 3a. cajas que ya tenian la carga inicial: los catalogos suben una vez (v0.2.16)
+    if !truthy_opt(state.get("catalogsLoadDone")) {
+        with_db(app, |conn| {
+            if outbox_enqueue_catalogs(conn).is_ok() {
+                save_cloud_state(conn, &json!({"catalogsLoadDone": true}));
             }
         });
     }
@@ -2819,6 +3000,141 @@ mod tests {
         assert!(apply_command(&conn, &alta("33333333-aaaa-4bbb-8ccc-0000000000ae", "  ", "Botanas")).1.contains("obligatorio"));
         assert_eq!(count(&conn), 2);
         assert_eq!(stock_of(&conn, "BEB-0001"), 10.0, "el producto que ya existía queda intacto");
+    }
+
+    #[test]
+    fn kardex_muestra_los_movimientos_del_producto_sin_cambiar_nada() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "222", "Refresco", 18.0, 5.0);
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"K1","items":[{"sku":"BEB-0001","qty":3},{"sku":"BEB-0002","qty":1}],"payments":{"Efectivo":54.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(apply_command(&conn, &json!({"id":"77777777-aaaa-4bbb-8ccc-000000000001","type":"stock_move","payload":{"internal_id":"BEB-0001","type":"entrada_compra","quantity":6,"reason":"Compra"}})).0, "aplicado");
+        assert_eq!(apply_command(&conn, &json!({"id":"77777777-aaaa-4bbb-8ccc-000000000002","type":"stock_move","payload":{"internal_id":"BEB-0001","type":"merma","quantity":2,"reason":"Rota"}})).0, "aplicado");
+        let before = snapshot(&conn);
+        let k = dispatch("product_kardex", &json!({"sku":"BEB-0001"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(before, snapshot(&conn), "el kardex solo lee");
+        let rows = k["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "solo los de ese producto");
+        assert!(rows.iter().all(|m| m["sku"] == "BEB-0001"));
+        assert_eq!((k["totals"]["ventas"].as_f64(), k["totals"]["entradas"].as_f64(), k["totals"]["salidas"].as_f64()), (Some(3.0), Some(6.0), Some(2.0)));
+        assert_eq!(k["product"]["stock"].as_f64(), Some(11.0));
+        // del más nuevo al más viejo y la existencia encadena
+        assert_eq!(num_of(rows[0].get("stockAfter")), 11.0);
+        assert_eq!(num_of(rows[2].get("stockBefore")), 10.0);
+        // el rango de fechas filtra
+        let k = dispatch("product_kardex", &json!({"sku":"BEB-0001","from":"2000-01-01T00:00:00Z","to":"2000-01-02T00:00:00Z"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(k["rows"].as_array().unwrap().len(), 0);
+        assert!(dispatch("product_kardex", &json!({}), &t, &conn, &mut s).is_err());
+        assert!(dispatch("product_kardex", &json!({"sku":"BEB-0001"}), "token-falso", &conn, &mut s).is_err());
+    }
+
+    // ---------- catalogos desde el panel (v0.2.16) ----------
+    fn cat_cmd(id: &str, payload: Value) -> Value { json!({"id": id, "type": "catalog_save", "payload": payload}) }
+
+    #[test]
+    fn renombrar_categoria_cambia_solo_ese_campo_en_sus_productos() {
+        let (conn, mut s, t) = fresh();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Bebidas"}), &t, &conn, &mut s).unwrap();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Botanas"}), &t, &conn, &mut s).unwrap();
+        put(&conn, "BEB-0001", "0111", "Agua", 12.0, 10.0);
+        put(&conn, "BEB-0002", "222", "Refresco", 18.0, 4.0);
+        create_item(&conn, "products", "BOT-0001", &json!({"sku":"BOT-0001","barcode":"333","name":"Papas","category":"Botanas","stock":5,"price":15,"cost":8,"active":true})).unwrap();
+        let before: Vec<Value> = list_items(&conn, "products");
+        let cmd = cat_cmd("44444444-aaaa-4bbb-8ccc-000000000001", json!({"kind":"category","id":"bebidas","old_name":"Bebidas","name":"Bebidas frías","description":"Refrigerador","by":"dueño@x.com"}));
+        assert_eq!(apply_command(&conn, &cmd), ("aplicado", String::new()));
+        let cat = get_item(&conn, "categories", "bebidas").unwrap();
+        assert_eq!(clean_text(cat.get("name")), "Bebidas frías");
+        assert_eq!(clean_text(cat.get("description")), "Refrigerador");
+        for b in &before {
+            let sku = clean_text(b.get("sku"));
+            let a = get_item(&conn, "products", &sku).unwrap();
+            // precio, código, nombre y existencia idénticos
+            for k in ["barcode", "name", "price", "cost", "stock", "minStock", "active", "unit", "presentation"] {
+                assert_eq!(a.get(k), b.get(k), "{} de {} cambió", k, sku);
+            }
+            let want = if clean_text(b.get("category")) == "Bebidas" { "Bebidas frías" } else { "Botanas" };
+            assert_eq!(clean_text(a.get("category")), want, "{}", sku);
+        }
+        // la misma orden otra vez no hace nada (ya estaba aplicada)
+        assert_eq!(apply_command(&conn, &cmd), ("aplicado", String::new()));
+        assert_eq!(count(&conn), 3);
+        // la venta sigue funcionando con la categoría nueva
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S-CAT","items":[{"sku":"BEB-0001","qty":2}],"payments":{"Efectivo":24.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 8.0);
+    }
+
+    #[test]
+    fn catalogo_desde_el_panel_rechaza_repetidos_y_datos_viejos() {
+        let (conn, mut s, t) = fresh();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Bebidas"}), &t, &conn, &mut s).unwrap();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Botanas"}), &t, &conn, &mut s).unwrap();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        // nombre repetido (sin importar mayúsculas) al renombrar y al crear
+        let why = apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000002", json!({"kind":"category","id":"bebidas","old_name":"Bebidas","name":"botanas"}))).1;
+        assert!(why.contains("Ya existe"), "{}", why);
+        let why = apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000003", json!({"kind":"category","name":" BEBIDAS "}))).1;
+        assert!(why.contains("Ya existe"), "{}", why);
+        // si el nombre cambió en la caja mientras la orden esperaba, se rechaza
+        dispatch("save_catalog", &json!({"kind":"category","id":"bebidas","name":"Refrescos"}), &t, &conn, &mut s).unwrap();
+        let why = apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000004", json!({"kind":"category","id":"bebidas","old_name":"Bebidas","name":"Bebidas frías"}))).1;
+        assert!(why.contains("cambió"), "{}", why);
+        assert!(apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000005", json!({"kind":"color","name":"Rojo"}))).1.contains("no reconocido"));
+        assert!(apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000006", json!({"kind":"category","name":"  "}))).1.contains("vacío"));
+        assert!(apply_command(&conn, &cat_cmd("44444444-aaaa-4bbb-8ccc-000000000007", json!({"kind":"category","id":"no-existe","name":"X"}))).1.contains("ya no existe"));
+        assert_eq!(clean_text(get_item(&conn, "products", "BEB-0001").unwrap().get("category")), "Bebidas", "nada se cambió");
+        assert_eq!(list_items(&conn, "categories").len(), 2);
+    }
+
+    #[test]
+    fn alta_y_desactivar_catalogos_desde_el_panel() {
+        let (conn, _s, _t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let alta = cat_cmd("55555555-aaaa-4bbb-8ccc-000000000001", json!({"kind":"supplier","name":"Distribuidora Sur","phone":"555 123","notes":"Martes"}));
+        assert_eq!(apply_command(&conn, &alta).0, "aplicado");
+        assert_eq!(apply_command(&conn, &alta).0, "aplicado", "repetida: no crea otro");
+        let sup = list_items(&conn, "suppliers");
+        assert_eq!(sup.len(), 1);
+        assert_eq!((clean_text(sup[0].get("id")), clean_text(sup[0].get("phone")), sup[0]["active"].clone()), ("distribuidora_sur".to_string(), "555 123".to_string(), json!(true)));
+        // unidad sin abreviatura toma el nombre; y se puede desactivar
+        assert_eq!(apply_command(&conn, &cat_cmd("55555555-aaaa-4bbb-8ccc-000000000002", json!({"kind":"unit","name":"Kilo"}))).0, "aplicado");
+        assert_eq!(clean_text(get_item(&conn, "units", "kilo").unwrap().get("abbreviation")), "Kilo");
+        assert_eq!(apply_command(&conn, &cat_cmd("55555555-aaaa-4bbb-8ccc-000000000003", json!({"kind":"unit","id":"kilo","old_name":"Kilo","name":"Kilo","active":false}))).0, "aplicado");
+        assert_eq!(get_item(&conn, "units", "kilo").unwrap()["active"], json!(false));
+        assert_eq!(stock_of(&conn, "BEB-0001"), 10.0);
+    }
+
+    #[test]
+    fn los_catalogos_viajan_a_la_nube_y_suben_una_vez_en_cajas_viejas() {
+        let (conn, mut s, t) = fresh();
+        dispatch("save_catalog", &json!({"kind":"unit","name":"Pieza","abbreviation":"pz"}), &t, &conn, &mut s).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        let c = batch["catalogs"].as_array().unwrap().iter().find(|c| c["id"] == "pieza").cloned().unwrap();
+        assert_eq!((c["kind"].clone(), c["name"].clone(), c["data"]["abbreviation"].clone(), c["active"].clone()), (json!("unit"), json!("Pieza"), json!("pz"), json!(true)));
+        // una caja que ya habia subido todo (sin catalogos) los encola una sola vez, sin cambiarlos
+        clear_outbox(&conn);
+        let before = snapshot(&conn);
+        outbox_enqueue_catalogs(&conn).unwrap();
+        assert_eq!(before, snapshot(&conn));
+        let keys = outbox_keys(&conn);
+        assert!(!keys.is_empty() && keys.iter().all(|(st, _)| ["categories", "units", "suppliers", "presentations"].contains(&st.as_str())), "{:?}", keys);
+        // borrar un catalogo viaja como borrado
+        clear_outbox(&conn);
+        dispatch("delete_catalog", &json!({"kind":"unit","id":"pieza"}), &t, &conn, &mut s).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        assert_eq!(batch["catalogs"][0]["deleted"], json!(true));
+        assert_eq!(batch["catalogs"][0]["name"], json!("Pieza"));
+    }
+
+    #[test]
+    fn remote_sync_tambien_entrega_catalogos() {
+        let (conn, mut s, t) = fresh();
+        dispatch("save_catalog", &json!({"kind":"category","name":"Bebidas"}), &t, &conn, &mut s).unwrap();
+        let seq = dispatch("remote_sync", &json!({}), &t, &conn, &mut s).unwrap()["seq"].as_i64().unwrap();
+        apply_command(&conn, &cat_cmd("66666666-aaaa-4bbb-8ccc-000000000001", json!({"kind":"category","id":"bebidas","old_name":"Bebidas","name":"Bebidas frías"})));
+        let r = dispatch("remote_sync", &json!({"since": seq}), &t, &conn, &mut s).unwrap();
+        assert_eq!(r["categories"][0]["name"], json!("Bebidas frías"));
     }
 
     #[test]

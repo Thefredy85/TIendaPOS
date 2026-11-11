@@ -70,7 +70,11 @@ Paso 1 y 2 en la v0.2.15 (diseño en `docs/superpowers/specs/2026-11-09-fase4-ed
 - [x] Alta de productos (`product_create`): existencia 0, código único revisado en la nube y en la caja.
 - [x] Sección **Modificados** (30 días, cancelar lo que espera, deshacer ediciones y movimientos).
 - [x] Sección **Revisión** (solo lectura): códigos repetidos, negativos, sin costo, precio ≤ costo, ventas sin descuento y nombres distintos a sus ventas. Reportes con Excel del periodo.
-- [ ] Catálogos (categorías, presentaciones) y usuarios de la caja desde el panel.
+Paso 3 en la v0.2.16 (migración `20261111000100_catalogos.sql`):
+- [x] La caja sube categorías, presentaciones, unidades y proveedores (`pos_catalogs`; las cajas que ya tenían la carga inicial los suben una vez).
+- [x] Sección **Catálogos**: alta, editar datos, activar/desactivar y renombrar (`catalog_save`). Al renombrar, la caja cambia ese campo en los productos que lo usan (nunca precio, código ni existencia), todo o nada, y rechaza nombres repetidos o un nombre que cambió en la caja. No se borra desde el panel.
+- [x] "Nuevo producto" y "Editar" usan la lista real de categorías de la caja.
+- [ ] Usuarios de la caja desde el panel (0.2.18).
 
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.
 - La app las descarga al tener internet, las aplica en orden, valida (por ejemplo, rechaza un código de barras duplicado) y confirma con `aplicado` o `rechazado` más el motivo.

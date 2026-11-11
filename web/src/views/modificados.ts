@@ -5,7 +5,7 @@ import { ago, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, toast } from
 // Primera versión de la app que aplica las órdenes del panel
 export const MIN_EDIT_VERSION = '0.2.15';
 
-const isOlder = (v: string, min: string) => {
+export const isOlder = (v: string, min: string) => {
   const a = v.split('.').map(Number); const b = min.split('.').map(Number);
   for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) < (b[i] || 0); }
   return false;
@@ -28,7 +28,8 @@ export function fieldValue(k: keyof ProductFields, v: string | number | undefine
 export const changedKeys = (after: ProductFields) => Object.keys(after) as (keyof ProductFields)[];
 
 const MOVE_TEXT: Record<MoveType, string> = { entrada_compra: 'Entrada por compra', salida_manual: 'Salida manual', merma: 'Merma' };
-const KNOWN = ['product_edit', 'stock_move', 'product_active', 'product_create'];
+const KNOWN = ['product_edit', 'stock_move', 'product_active', 'product_create', 'catalog_save'];
+const CATALOG_ONE: Record<string, string> = { category: 'Categoría', presentation: 'Presentación', unit: 'Unidad', supplier: 'Proveedor' };
 
 // Qué dice cada cambio en una línea
 function describe(c: RemoteChange): string {
@@ -38,6 +39,17 @@ function describe(c: RemoteChange): string {
     return `${MOVE_TEXT[p.type as MoveType] ?? p.type} ${p.type === 'entrada_compra' ? '+' : '−'}${fmtQty(q)} · ${p.reason ?? ''}`;
   }
   if (c.type === 'product_active') return p.active ? 'Activar (vuelve a la venta)' : 'Desactivar (sale de la venta)';
+  if (c.type === 'catalog_save') {
+    const parts: string[] = [];
+    if (!p.id) parts.push('Alta');
+    else if (p.old_name && p.old_name !== p.name) parts.push(`Nombre ${p.old_name} → ${p.name} (también en sus productos)`);
+    if (p.active === false) parts.push('Desactivar');
+    if (p.active === true) parts.push('Activar');
+    for (const [k, l] of [['description', 'Descripción'], ['abbreviation', 'Abreviatura'], ['phone', 'Teléfono'], ['notes', 'Notas']] as const) {
+      if (p[k] !== undefined && p[k] !== '') parts.push(`${l}: ${p[k]}`);
+    }
+    return `${CATALOG_ONE[p.kind ?? ''] ?? 'Catálogo'} · ${parts.join(' · ') || 'Datos'}`;
+  }
   if (c.type === 'product_create') return `Alta · código ${p.barcode ?? '—'} · ${p.category ?? ''} · costo ${fmtMoney(Number(p.cost ?? 0))} · precio ${fmtMoney(Number(p.price ?? 0))}`;
   return changedKeys(p.after).map((k) => `${FIELD_LABEL[k]} ${fieldValue(k, p.before[k])} → ${fieldValue(k, p.after[k])}`).join(' · ');
 }
@@ -68,7 +80,7 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
     // Se deshacen cambios de datos (si no hay otro esperando) y movimientos (con el movimiento contrario)
     const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id)
       && (c.type === 'stock_move' || (c.type === 'product_edit' && !busy.has(c.payload.internal_id)));
-    const title = (c: RemoteChange) => c.type === 'product_create' ? (c.payload.name ?? 'Producto nuevo')
+    const title = (c: RemoteChange) => c.type === 'product_create' || c.type === 'catalog_save' ? (c.payload.name ?? 'Producto nuevo')
       : names.get(c.payload.internal_id) ?? 'Producto ya no disponible';
 
     el.innerHTML = `${!canApply && ctx.canManageDevices ? `<div class="banner wait">${icon('shield-alert')}<span class="small">${esc(OLD_APP_NOTICE)}</span></div>` : ''}

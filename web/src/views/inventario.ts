@@ -3,6 +3,7 @@ import { createProduct, editProduct, listProducts, productMovements, recentChang
 import { codeKey, downloadCsv, esc, fmtDateTime, fmtMoney, fmtQty, icon, openSheet, paintIcons, toast, todayIso } from '../ui';
 import { moveLabel, moveQty } from './movimientos';
 import { changedKeys, fieldValue, OLD_APP_NOTICE, storeCanApply } from './modificados';
+import { categoryNames } from './catalogos';
 
 type Filter = '' | 'bajo' | 'bajo-con' | 'negativo' | 'agotado' | 'sin-existencia' | 'sin-costo' | 'desactivados';
 
@@ -134,10 +135,12 @@ function editWarnings(before: Required<ProductFields>, after: ProductFields): st
   return out;
 }
 
-function openEdit(ctx: Ctx, p: Product, products: Product[], canApply: boolean) {
+async function openEdit(ctx: Ctx, p: Product, products: Product[], canApply: boolean) {
   const before: Required<ProductFields> = { cost: p.cost ?? 0, price: p.price ?? 0, name: p.name ?? '', category: p.category ?? '', min_stock: p.min_stock ?? 0 };
-  // incluye la categoría actual aunque esté vacía: abrir y guardar no debe cambiarla sin querer
-  const cats = [...new Set([before.category, ...products.map((x) => x.category ?? '').filter(Boolean)])].sort();
+  // incluye la categoría actual aunque esté vacía: abrir y guardar no debe cambiarla sin querer.
+  // Las demás salen del catálogo de la caja (la caja solo acepta categorías que existen).
+  const { names } = await categoryNames(ctx.business.id, products);
+  const cats = [...new Set([before.category, ...names])].sort();
   const body = openSheet(`Editar: ${p.name ?? 'Producto'}`, '');
   const close = () => body.closest('.sheet-bg')?.remove();
   let draft: ProductFields = {};
@@ -299,9 +302,9 @@ function openActive(ctx: Ctx, p: Product, canApply: boolean) {
 async function openNew(ctx: Ctx, products: Product[]) {
   let canApply = true;
   try { canApply = await storeCanApply(ctx.business.id); } catch { /* se avisa si falla al enviar */ }
+  const { names: cats, fromCatalog } = await categoryNames(ctx.business.id, products);
   const body = openSheet('Nuevo producto', '');
   const close = () => body.closest('.sheet-bg')?.remove();
-  const cats = [...new Set(products.map((x) => x.category ?? '').filter(Boolean))].sort();
   let d = { barcode: '', name: '', category: cats[0] ?? '', cost: '', price: '', min: '0' };
   const form = () => {
     body.innerHTML = `<form class="edit-form" novalidate>
@@ -316,7 +319,7 @@ async function openNew(ctx: Ctx, products: Product[]) {
         <label>Categoría<select id="n-cat">${cats.map((c) => `<option${c === d.category ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
         <label>Mínimo<input id="n-min" type="number" inputmode="decimal" step="1" min="0" value="${esc(d.min)}"></label>
       </div>
-      <div class="small muted">Nace con existencia 0. Para ponerle existencia, después haz una entrada desde su ficha. Si la categoría que buscas no aparece, créala primero en la caja.</div>
+      <div class="small muted">Nace con existencia 0. Para ponerle existencia, después haz una entrada desde su ficha. ${fromCatalog ? 'Si la categoría que buscas no aparece, créala en Catálogos.' : 'Si la categoría que buscas no aparece, créala primero en la caja.'}</div>
       <div class="err" role="alert"></div>
       <div class="modal-actions" style="margin-top:14px"><button class="btn" type="button" id="n-cancel">Cancelar</button><button class="btn primary" type="submit">Revisar</button></div>
     </form>`;

@@ -641,6 +641,79 @@ async function main() {
       check(await page.evaluate((n) => state.products.length === n + 1, count0), '11d) solo se agrega uno');
       check((await call('__test_get_product', { sku: 'BEB-0001' })).stock === base.stock + 4, '11d) los demás productos quedan intactos');
       check(await page.evaluate((n) => state.sales.length === n, sales), '11d) las ventas quedan intactas');
+
+      // 11e) Renombrar una categoría desde el panel (v0.2.16): cambia SOLO la categoría de sus productos
+      await page.evaluate(() => { state.cart = []; clearCartDraft(); renderCart(); }); // el ticket del caso 11 no se cobra
+      const catId = await page.evaluate(() => state.categories.find((c) => c.name === 'Bebidas')?.id || '');
+      if (!catId) await call('__test_put_item', { store: 'categories', id: 'CAT-BEB', data: { id: 'CAT-BEB', name: 'Bebidas', active: true } });
+      const bebId = catId || 'CAT-BEB';
+      const prods0 = await page.evaluate(() => state.products.map((p) => ({ ...p })));
+      const bebidas0 = await Promise.all(prods0.filter((p) => p.category === 'Bebidas').map((p) => call('__test_get_product', { sku: p.sku })));
+      const others0 = await Promise.all(prods0.filter((p) => p.category !== 'Bebidas').map((p) => call('__test_get_product', { sku: p.sku })));
+      const ren = (id, from, to) => ({ id, type: 'catalog_save', payload: { kind: 'category', id: bebId, old_name: from, name: to, by: 'dueno@correo.com' } });
+      const r1 = await call('__test_apply_command', ren('66666666-aaaa-4bbb-8ccc-000000000001', 'Bebidas', 'Bebidas frías'));
+      check(r1.status === 'aplicado', '11e) la caja aplica el cambio de nombre de la categoría', JSON.stringify(r1));
+      const dupCat = await call('__test_apply_command', { id: '66666666-aaaa-4bbb-8ccc-000000000002', type: 'catalog_save', payload: { kind: 'category', name: 'botanas' } });
+      check(dupCat.status === 'rechazado' && dupCat.result.includes('Ya existe'), '11e) un nombre repetido se rechaza', JSON.stringify(dupCat));
+      await page.evaluate(() => pollRemoteChanges());
+      let renOk = bebidas0.length > 0;
+      for (const b of bebidas0) {
+        const a = await call('__test_get_product', { sku: b.sku });
+        if (a.category !== 'Bebidas frías' || a.stock !== b.stock || a.price !== b.price || a.cost !== b.cost || a.name !== b.name || a.barcode !== b.barcode || a.active !== b.active) renOk = false;
+      }
+      check(renOk, '11e) sus productos cambian de categoría con precio, código, nombre y existencia intactos', `${bebidas0.length} productos`);
+      let othersOk = true;
+      for (const b of others0) if (JSON.stringify(await call('__test_get_product', { sku: b.sku })) !== JSON.stringify(b)) othersOk = false;
+      check(othersOk, '11e) los productos de otras categorías quedan idénticos');
+      check(await page.evaluate(() => state.categories.some((c) => c.name === 'Bebidas frías') && productsInCategory('Bebidas frías').some((p) => p.sku === 'BEB-0001')), '11e) la pantalla ve la categoría nueva con sus productos');
+      check(await page.evaluate((n) => state.sales.length === n, sales), '11e) las ventas quedan intactas');
+      const s11e = await stock('BEB-0001');
+      await sellByScan('111');
+      check((await stock('BEB-0001')) === s11e - 1, '11e) se sigue vendiendo y descontando con la categoría nueva');
+      await call('__test_apply_command', ren('66666666-aaaa-4bbb-8ccc-000000000003', 'Bebidas frías', 'Bebidas'));
+      await page.evaluate(() => pollRemoteChanges());
+      check((await call('__test_get_product', { sku: 'BEB-0001' })).category === 'Bebidas', '11e) se puede regresar al nombre anterior');
+
+      // 11f) Kardex por producto: muestra sus movimientos y no cambia nada
+      const k0 = await call('__test_get_product', { sku: 'BEB-0001' });
+      await page.evaluate(() => show('kardex'));
+      await page.waitForSelector('#view-kardex:not(.hide)', { timeout: 4000 });
+      await page.fill('#kardexSearch', '0111');
+      await page.click('#kardexRunBtn');
+      await page.waitForFunction(() => document.querySelectorAll('#kardexTable tbody tr').length > 0, null, { timeout: 6000 });
+      const kTxt = await page.locator('#kardexTable').innerText();
+      check(['Venta', 'Entrada', 'Merma'].every((t) => kTxt.includes(t)), '11f) el kardex muestra ventas, entradas y mermas del producto');
+      check(!kTxt.includes('Papas 45 g'), '11f) solo trae movimientos de ese producto');
+      const kSum = await page.locator('#kardexSummary').innerText();
+      check(kSum.includes(String(k0.stock)), '11f) el resumen muestra la existencia actual', kSum.replace(/\s+/g, ' '));
+      check(JSON.stringify(await call('__test_get_product', { sku: 'BEB-0001' })) === JSON.stringify(k0), '11f) consultar no cambia el producto');
+      await page.evaluate(() => show('pos'));
+
+      // 11g) Atajos: F6 deja el ticket en espera, F9 cobra y F10 abre el corte
+      await tapProduct(page, 'BEB-0001');
+      const held0 = await page.evaluate(() => state.heldTickets.length);
+      await page.keyboard.press('F6');
+      check(await page.evaluate((n) => state.heldTickets.length === n + 1 && state.cart.length === 0, held0), '11g) F6 deja el ticket en espera');
+      await page.evaluate(() => resumeHeldTicket(state.heldTickets[0].id));
+      check(await page.evaluate((n) => state.heldTickets.length === n && state.cart.length === 1, held0), '11g) el ticket en espera se recupera completo');
+      const s11g = await stock('BEB-0001');
+      const sales11g = await page.evaluate(() => state.sales.length);
+      await page.keyboard.press('F9');
+      check(await page.evaluate(() => state.view === 'checkout'), '11g) F9 abre el cobro');
+      await page.click('#autoFillPaymentBtn');
+      await page.click('#addPaymentBtn');
+      await page.keyboard.press('F9');
+      await page.waitForFunction(() => state.cart.length === 0, null, { timeout: 6000 }).catch(() => {});
+      check((await stock('BEB-0001')) === s11g - 1, '11g) F9 otra vez cobra y descuenta una sola vez', `${s11g} -> ${await stock('BEB-0001')}`);
+      check(await page.evaluate((n) => state.sales.length === n + 1, sales11g), '11g) queda una venta');
+      await page.waitForSelector('#receiptDialog[open]', { timeout: 8000 }).catch(() => {});
+      await page.click('#closeReceiptBtn').catch(() => {});
+      await page.evaluate(() => { document.querySelectorAll('dialog[open]').forEach((d) => d.close()); show('pos'); });
+      await page.keyboard.press('F9');
+      check(await page.evaluate(() => state.view === 'pos'), '11g) F9 con el ticket vacío no abre el cobro');
+      await page.keyboard.press('F10');
+      check(await page.evaluate(() => state.view === 'cashcut'), '11g) F10 abre el corte de caja');
+      await page.evaluate(() => show('pos'));
     }
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
