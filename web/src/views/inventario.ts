@@ -260,8 +260,9 @@ function openMove(ctx: Ctx, p: Product, canApply: boolean) {
         table: `<div class="card table-wrap"><table class="table"><tbody>
           <tr><td>Movimiento</td><td><b>${MOVE_LABEL[draft.type]}</b></td></tr>
           <tr><td>Cantidad</td><td><b class="num">${delta > 0 ? '+' : '−'}${fmtQty(qty)}</b></td></tr>
-          <tr><td>Existencia</td><td class="num">${fmtQty(stock)} → <b>${fmtQty(after)}</b> <span class="small muted">(aprox.: la caja pudo vender mientras tanto)</span></td></tr>
-          <tr><td>Motivo</td><td>${esc(draft.reason)}</td></tr></tbody></table></div>`,
+          <tr><td>Existencia</td><td class="num">${fmtQty(stock)} → <b>${fmtQty(after)}</b></td></tr>
+          <tr><td>Motivo</td><td>${esc(draft.reason)}</td></tr></tbody></table></div>
+          <div class="small muted" style="margin-top:6px">La existencia final es aproximada: la caja pudo vender mientras tanto.</div>`,
         warns, onBack: form,
         onSend: async () => {
           await stockMove(ctx.business.id, p.internal_id, draft.type, qty, draft.reason);
