@@ -255,6 +255,12 @@ export interface SuspiciousProduct { internal_id: string; barcode: string | null
 export async function suspiciousProducts(businessId: string): Promise<SuspiciousProduct[]> {
   return check(await sb.rpc('panel_suspicious_products', { p_business_id: businessId })) as SuspiciousProduct[];
 }
+export interface StockWithoutSale { internal_id: string; barcode: string | null; name: string | null; category: string | null; stock: number | null;
+  last_in_ts: string; last_in_qty: number | null; last_in_user: string | null; last_sale_ts: string | null }
+export async function stockWithoutSales(businessId: string, from: Date, to: Date): Promise<StockWithoutSale[]> {
+  return (check(await sb.rpc('panel_stock_without_sales', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString() })) as StockWithoutSale[])
+    .map((r) => ({ ...r, stock: n(r.stock), last_in_qty: n(r.last_in_qty) }));
+}
 export interface SaleWithoutMove { sale_id: string; ts: string | null; internal_id: string | null; name: string | null; qty: number | null }
 export async function salesWithoutMoves(businessId: string, from: Date, to: Date): Promise<SaleWithoutMove[]> {
   return check(await sb.rpc('panel_sales_without_moves', { p_business_id: businessId, p_from: from.toISOString(), p_to: to.toISOString() })) as SaleWithoutMove[];

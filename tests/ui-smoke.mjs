@@ -856,6 +856,72 @@ async function main() {
     check(csv15 >= 4000, '15) el historial completo del periodo sigue disponible (filtro y archivo)', String(csv15));
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
+
+    // Reportes de tienda: "el flan desapareció" (merma en vez de entrada, sin saber quién) y
+    // "los bimbuñuelos no aparecen" (se buscaban sin ñ)
+    console.log('\n16) Quién hizo cada cambio, motivo en salidas y mermas, aviso al guardar y búsqueda sin acentos');
+    await seed([product('BIM-0001', '7501030472698', 'Bimbuñuelos', 22, 5), product('FLA-0001', '7501020510041', 'Flan lala', 10, 9)]);
+    await call('save_catalog', { kind: 'category', name: 'Bebidas' }, (await call('login', { code: '1234' })).sessionToken);
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await login(page);
+    await openCash(page).catch(() => {});
+    await page.fill('#saleSearchInput', 'bimbunuelos');
+    await page.evaluate(() => renderSaleSearch());
+    check(await page.locator('#saleSearchResults [data-add="BIM-0001"]').count() === 1, '16) buscar "bimbunuelos" (sin ñ) encuentra "Bimbuñuelos"');
+    await page.fill('#saleSearchInput', '');
+    await page.evaluate(() => renderSaleSearch());
+    const token16 = (await call('login', { code: '1234' })).sessionToken;
+    const moves16 = async (sku) => (await call('history', { kind: 'moves', from: '2000-01-01T00:00:00Z', to: '' }, token16)).rows.filter((m) => m.sku === sku);
+    await page.evaluate(() => { show('movements'); });
+    await page.waitForSelector('#view-movements:not(.hide)');
+    const pick16 = async (sku, qty, type) => {
+      await page.evaluate(([t]) => setMoveType(t), [type]);
+      await page.selectOption('#moveCategory', 'Bebidas');
+      await page.selectOption('#moveSku', sku);
+      await page.fill('#moveQty', String(qty));
+    };
+    // merma sin motivo: no se registra
+    await pick16('FLA-0001', 9, 'merma');
+    await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
+    await page.waitForTimeout(500);
+    check((await stock('FLA-0001')) === 9 && (await page.locator('#confirmDialog[open]').count()) === 0, '16) una merma sin motivo no se registra');
+    // con motivo: pide confirmar diciendo cómo queda la existencia; si se cancela, nada cambia
+    await page.fill('#moveReason', 'Caducado');
+    await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
+    await page.waitForSelector('#confirmDialog[open]', { timeout: 4000 }).catch(() => {});
+    const conf16 = await page.locator('#confirmMessage').innerText().catch(() => '');
+    check(/Merma de 9/.test(conf16) && /de 9 a 0/.test(conf16) && /Flan lala/.test(conf16), '16) la merma pide confirmar con producto, cantidad y existencia (9 → 0)', conf16);
+    await page.click('#cancelConfirmBtn');
+    await page.waitForTimeout(300);
+    check((await stock('FLA-0001')) === 9 && (await moves16('FLA-0001')).length === 0, '16) al cancelar no se registra nada');
+    // entrada de 8: aviso grande con lo que se guardó
+    await pick16('FLA-0001', 8, 'entrada_compra');
+    await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
+    await page.waitForFunction(() => /Flan lala/.test(document.getElementById('moveResult')?.textContent || ''), null, { timeout: 6000 }).catch(() => {});
+    const res16 = await page.locator('#moveResult').innerText().catch(() => '');
+    check((await stock('FLA-0001')) === 17 && /Entrada/.test(res16) && /\+8/.test(res16) && /17/.test(res16), '16) al guardar se ve en grande: "Entrada: Flan lala +8 → existencia 17"', res16);
+    // merma confirmada: queda con motivo y usuario
+    await pick16('FLA-0001', 2, 'merma');
+    await page.fill('#moveReason', 'Caducado');
+    await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
+    await page.waitForSelector('#confirmDialog[open]', { timeout: 4000 }).catch(() => {});
+    await page.click('#acceptConfirmBtn');
+    await page.waitForFunction(() => /Merma/.test(document.getElementById('moveResult')?.textContent || ''), null, { timeout: 6000 }).catch(() => {});
+    const m16 = (await moves16('FLA-0001')).find((m) => m.type === 'merma');
+    check((await stock('FLA-0001')) === 15 && m16 && m16.reason === 'Caducado' && m16.user === 'Admin', '16) la merma queda con su motivo y quién la hizo', JSON.stringify(m16 && [m16.reason, m16.user]));
+    check(/Registrados antes/.test(await page.locator('#moveResult').innerText()), '16) el aviso muestra también lo registrado antes');
+    check(/Admin/.test(await page.locator('#movesTable').innerText()) && /Caducado/.test(await page.locator('#movesTable').innerText()), '16) la tabla de movimientos muestra usuario y motivo');
+    // editar el precio en la caja queda registrado con el cambio y quién lo hizo
+    await page.evaluate(() => { show('products'); editProduct('BIM-0001'); });
+    await page.fill('#priceInput', '25');
+    await page.evaluate(() => document.getElementById('productForm').requestSubmit());
+    await page.waitForTimeout(1200);
+    const ed16 = (await moves16('BIM-0001')).filter((m) => m.type === 'edicion_producto');
+    check(ed16.length === 1 && /Precio: \$22\.00 → \$25\.00/.test(ed16[0].notes) && ed16[0].user === 'Admin', '16) editar el precio queda registrado (Precio: $22.00 → $25.00, Admin)', JSON.stringify(ed16.map((m) => [m.notes, m.user])));
+    check((await stock('BIM-0001')) === 5, '16) editar no cambia la existencia');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
   } finally {
     if (browser) await browser.close().catch(() => {});
     server.kill();

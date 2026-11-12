@@ -27,6 +27,7 @@ Ninguna versión se publica (etiqueta `vX`) sin completar esta rutina, mostrar l
 | Alta de productos | normal; categoría sin productos; buscador con texto; Editar → salir sin guardar → alta (no pisa a otro); Cancelar edición; cambio de nombre+código pide confirmar | ui-smoke 5 |
 | Productos existentes | nombre, código y existencia idénticos antes y después | ui-smoke 5, Rust bases viejas |
 | Inventario | solo cambia por venta, cancelación, entrada/salida o conteo; una actualización nunca lo toca; el diagnóstico no corrige nada | ui-smoke 6 y 8 |
+| **Quién hizo qué** (desde v0.2.19) | toda alta, edición (con el antes → después), activar/desactivar, eliminación, entrada, salida y merma queda en Movimientos con usuario (o "Panel: correo"); salidas y mermas piden motivo y confirmación con la existencia resultante; al guardar se ve el aviso grande | ui-smoke 16; Rust `cada_cambio_de_producto…` |
 | Cobro | tocar; escanear; producto sin código; precio cambiado; pago mixto; reintento con el mismo folio no descuenta dos veces | ui-smoke 1–3 y 6 |
 | Cancelar venta | devuelve el inventario una sola vez | ui-smoke 6; Rust |
 | Cortes | abrir caja; Corte X; Corte Z; Z se niega con tickets en espera o productos sin cobrar; después del Z se puede abrir otra vez | ui-smoke 6; Rust `cortes_x_y_z_completos` |

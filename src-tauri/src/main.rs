@@ -1638,23 +1638,22 @@ fn op_save_product(conn: &Connection, sessions: &mut HashMap<String, Session>, t
     });
     if let Some(e) = &existing {
         let existing_sku = clean_text(e.get("sku"));
-        if existing_sku != sku {
-            if exists { return Err("Ese SKU ya existe".into()); }
+        if existing_sku != sku && exists { return Err("Ese SKU ya existe".into()); }
+        // v0.2.19: queda registrado quien cambio que (todo junto o nada)
+        all_or_nothing(conn, || {
             create_item(conn, "products", &sku, &record)?;
-            delete_item(conn, "products", &existing_sku)?;
-        } else {
-            create_item(conn, "products", &sku, &record)?;
-        }
+            if existing_sku != sku { delete_item(conn, "products", &existing_sku)?; }
+            record_product_edit(conn, e, &record, &display_or_username(&user))
+        })?;
     } else {
         // alta: la existencia inicial deja su movimiento (quien y cuanto), todo junto o nada
         let initial = num_of(record.get("stock"));
         if initial < 0.0 { return Err("La existencia inicial no puede ser negativa".into()); }
         all_or_nothing(conn, || {
             create_item(conn, "products", &sku, &record)?;
-            if initial > 0.0 {
-                record_product_move(conn, "alta_producto", &record, 0.0, initial, &user, "Alta de producto con existencia inicial")?;
-            }
-            Ok(())
+            // v0.2.19: toda alta queda registrada (con o sin existencia inicial)
+            let reason = if initial > 0.0 { "Alta de producto con existencia inicial" } else { "Alta de producto" };
+            record_product_move(conn, "alta_producto", &record, 0.0, initial, &user, reason)
         })?;
     }
     Ok(json!({"ok": true, "product": record}))
@@ -1695,7 +1694,13 @@ fn op_movement(conn: &Connection, sessions: &mut HashMap<String, Session>, token
     let product = get_item(conn, "products", &sku).ok_or_else(|| "Producto no encontrado".to_string())?;
     let mut qty = num_of(payload.get("quantity")).abs();
     if !qty.is_finite() || qty <= 0.0 || qty > 100000.0 { return Err("La cantidad no es válida".into()); }
-    if ["salida_manual", "merma"].contains(&mtype.as_str()) { qty = -qty; }
+    if ["salida_manual", "merma"].contains(&mtype.as_str()) {
+        qty = -qty;
+        // v0.2.19: toda salida o merma dice por que (control de lo que sale)
+        if clean_text(payload.get("reason")).is_empty() {
+            return Err("Escribe el motivo de la salida o merma (por ejemplo: caducado, roto, consumo interno).".into());
+        }
+    }
     let before = num_of(product.get("stock"));
     let after = before + qty;
     // la existencia nunca baja de 0
@@ -1837,6 +1842,12 @@ fn fmt_qty(n: f64) -> String {
 
 // v0.2.18: guarda un movimiento de alta o baja de producto (no cambia la existencia por si mismo).
 fn record_product_move(conn: &Connection, mtype: &str, product: &Value, before: f64, after: f64, user: &Value, reason: &str) -> Result<(), String> {
+    record_product_note(conn, mtype, product, before, after, &display_or_username(user), reason, "")
+}
+
+// v0.2.19: registro de quien hizo un cambio a un producto (alta, baja, edicion, activar).
+// Va en Movimientos (y a la nube) con cantidad 0 cuando la existencia no cambia.
+fn record_product_note(conn: &Connection, mtype: &str, product: &Value, before: f64, after: f64, user_label: &str, reason: &str, notes: &str) -> Result<(), String> {
     let sku = clean_text(product.get("sku"));
     let id = format!("MOV-{}-{}", now_millis(), random_suffix());
     let qty = after - before;
@@ -1846,8 +1857,40 @@ fn record_product_move(conn: &Connection, mtype: &str, product: &Value, before: 
         "productName": clean_text(product.get("name")),
         "quantity": qty, "stockBefore": before, "stockAfter": after,
         "unitCost": cost, "totalCost": qty * cost,
-        "reason": reason, "reference": "", "user": display_or_username(user), "authorizedBy": "", "notes": ""
+        "reason": reason, "reference": "", "user": user_label, "authorizedBy": "", "notes": notes
     }))
+}
+
+// Que cambio entre dos versiones de un producto, en palabras ("Precio: $10.00 → $12.00; ...").
+// No incluye la existencia (esa solo cambia por movimientos) ni activo/inactivo.
+fn product_changes(old: &Value, new: &Value) -> String {
+    let mut out: Vec<String> = vec![];
+    for (key, label) in [("name", "Nombre"), ("barcode", "Código"), ("category", "Categoría"), ("presentation", "Presentación"), ("unit", "Unidad"), ("supplier", "Proveedor"), ("description", "Descripción")] {
+        let (a, b) = (clean_text(old.get(key)), clean_text(new.get(key)));
+        if a != b { out.push(format!("{}: \"{}\" → \"{}\"", label, a, b)); }
+    }
+    for (key, label, money) in [("cost", "Costo", true), ("price", "Precio", true), ("minStock", "Mínimo", false)] {
+        let (a, b) = (num_of(old.get(key)), num_of(new.get(key)));
+        if (a - b).abs() > 1e-9 {
+            out.push(if money { format!("{}: ${:.2} → ${:.2}", label, a, b) } else { format!("{}: {} → {}", label, fmt_qty(a), fmt_qty(b)) });
+        }
+    }
+    out.join("; ")
+}
+
+// Anota la edicion y/o el cambio de activo de un producto ya guardado.
+fn record_product_edit(conn: &Connection, old: &Value, new: &Value, user_label: &str) -> Result<(), String> {
+    let stock = num_of(new.get("stock"));
+    let changes = product_changes(old, new);
+    if !changes.is_empty() {
+        record_product_note(conn, "edicion_producto", new, stock, stock, user_label, "Cambio de datos del producto", &changes)?;
+    }
+    let (was, now) = (not_false(old.get("active")), not_false(new.get("active")));
+    if was != now {
+        let (t, r) = if now { ("producto_activado", "Producto activado") } else { ("producto_desactivado", "Producto desactivado") };
+        record_product_note(conn, t, new, stock, stock, user_label, r, "")?;
+    }
+    Ok(())
 }
 
 fn op_checkout(conn: &Connection, sessions: &mut HashMap<String, Session>, token: &str, payload: &Value) -> Result<Value, String> {
@@ -2496,6 +2539,8 @@ fn apply_product_edit(conn: &Connection, payload: &Value) -> Result<bool, String
         }
     }
     patch_item(conn, "products", &sku, &Value::Object(patch))?;
+    let updated = get_item(conn, "products", &sku).unwrap_or_else(|| current.clone());
+    record_product_edit(conn, &current, &updated, &panel_user(payload))?;
     Ok(true)
 }
 
@@ -2551,6 +2596,9 @@ fn apply_product_active(conn: &Connection, payload: &Value) -> Result<bool, Stri
     let active = payload.get("active").and_then(|v| v.as_bool()).ok_or("La orden no dice si activar o desactivar")?;
     if not_false(product.get("active")) == active { return Ok(false); }
     patch_item(conn, "products", &sku, &json!({"active": active}))?;
+    let mut updated = product.clone();
+    updated["active"] = json!(active);
+    record_product_edit(conn, &product, &updated, &panel_user(payload))?;
     Ok(true)
 }
 
@@ -2581,7 +2629,7 @@ fn apply_product_create(conn: &Connection, cmd_id: &str, payload: &Value) -> Res
     let min = money_of("min_stock", "mínimo")?;
     let (cost_iva, cost_wo) = iva_parts(cost);
     let (price_iva, price_wo) = iva_parts(price);
-    create_item(conn, "products", &sku, &json!({
+    let record = json!({
         "sku": sku, "barcode": barcode, "name": name,
         "category": clean_text(cat.get("name")),
         "presentation": "", "supplier": "", "unit": "pieza",
@@ -2589,7 +2637,9 @@ fn apply_product_create(conn: &Connection, cmd_id: &str, payload: &Value) -> Res
         "costIva": cost_iva, "priceIva": price_iva,
         "costWithoutIva": cost_wo, "priceWithoutIva": price_wo,
         "stock": 0.0, "minStock": min, "description": "", "active": true
-    }))?;
+    });
+    create_item(conn, "products", &sku, &record)?;
+    record_product_note(conn, "alta_producto", &record, 0.0, 0.0, &panel_user(payload), "Alta de producto desde el panel", "")?;
     Ok(true)
 }
 
@@ -3721,11 +3771,11 @@ mod tests {
             list_items(conn, "moves").into_iter().filter(|m| clean_text(m.get("sku")) == sku && clean_text(m.get("type")) == ty).collect()
         };
         // salida o merma mayor a lo que hay: se rechaza y no deja movimiento
-        let e = dispatch("movement", &json!({"sku":"BEB-0001","type":"merma","quantity":4}), &t, &conn, &mut s).unwrap_err();
+        let e = dispatch("movement", &json!({"sku":"BEB-0001","type":"merma","quantity":4,"reason":"Caducado"}), &t, &conn, &mut s).unwrap_err();
         assert!(e.contains("existencia"), "{}", e);
         assert_eq!(stock_of(&conn, "BEB-0001"), 3.0);
         assert!(movs_of(&conn, "BEB-0001", "merma").is_empty());
-        dispatch("movement", &json!({"sku":"BEB-0001","type":"salida_manual","quantity":3}), &t, &conn, &mut s).unwrap();
+        dispatch("movement", &json!({"sku":"BEB-0001","type":"salida_manual","quantity":3,"reason":"Consumo interno"}), &t, &conn, &mut s).unwrap();
         assert_eq!(stock_of(&conn, "BEB-0001"), 0.0);
         // entrada de 5 y luego borrar esa entrada despues de vender 4: dejaria -4, se rechaza
         let m = dispatch("movement", &json!({"sku":"BEB-0001","type":"entrada_compra","quantity":5}), &t, &conn, &mut s).unwrap();
@@ -3754,10 +3804,12 @@ mod tests {
         assert_eq!(altas.len(), 1);
         assert_eq!((num_of(altas[0].get("quantity")), num_of(altas[0].get("stockBefore")), num_of(altas[0].get("stockAfter"))), (6.0, 0.0, 6.0));
         assert_eq!(clean_text(altas[0].get("user")), "Admin");
-        // alta en 0: no hace falta movimiento
+        // v0.2.19: el alta en 0 tambien queda registrada (quien agrego el producto)
         let b = dispatch("save_product", &json!({"mode":"new","record":{"barcode":"444","name":"Galletas","category":"Bebidas","price":15,"cost":8,"stock":0}}), &t, &conn, &mut s).unwrap();
-        assert!(movs_of(&conn, &clean_text(b["product"].get("sku")), "alta_producto").is_empty());
-        // editar no crea movimiento ni cambia la existencia
+        let alta0 = movs_of(&conn, &clean_text(b["product"].get("sku")), "alta_producto");
+        assert_eq!(alta0.len(), 1);
+        assert_eq!(num_of(alta0[0].get("quantity")), 0.0);
+        // editar no cambia la existencia (y su registro es "edicion_producto", no un alta)
         dispatch("save_product", &json!({"mode":"edit","editingSku":jugo,"record":{"barcode":"333","name":"Jugo","category":"Bebidas","price":16,"cost":8,"stock":99}}), &t, &conn, &mut s).unwrap();
         assert_eq!(stock_of(&conn, &jugo), 6.0);
         assert_eq!(movs_of(&conn, &jugo, "alta_producto").len(), 1);
@@ -3771,6 +3823,60 @@ mod tests {
         assert_eq!(clean_text(bajas[0].get("user")), "Admin");
         // los demas productos intactos
         assert_eq!(stock_of(&conn, "BEB-0001"), 3.0);
+    }
+
+    // v0.2.19: cada cambio a un producto (en la caja o desde el panel) queda en Movimientos
+    // con quien lo hizo y que cambio; las salidas y mermas piden motivo.
+    #[test]
+    fn cada_cambio_de_producto_queda_registrado_con_quien_lo_hizo() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 10.0, 5.0);
+        dispatch("save_catalog", &json!({"kind":"category","name":"Bebidas"}), &t, &conn, &mut s).unwrap();
+        let movs_of = |conn: &Connection, ty: &str| -> Vec<Value> {
+            list_items(conn, "moves").into_iter().filter(|m| clean_text(m.get("type")) == ty).collect()
+        };
+        let rec = |price: f64, name: &str, active: bool| json!({"mode":"edit","editingSku":"BEB-0001","record":{"barcode":"111","name":name,"category":"Bebidas","presentation":"Pieza","unit":"pieza","price":price,"cost":5.0,"minStock":1,"active":active}});
+        // editar en la caja: precio y nombre
+        dispatch("save_product", &rec(12.0, "Agua 1 L", true), &t, &conn, &mut s).unwrap();
+        let e = movs_of(&conn, "edicion_producto");
+        assert_eq!(e.len(), 1);
+        assert_eq!(clean_text(e[0].get("user")), "Admin");
+        assert_eq!((num_of(e[0].get("quantity")), num_of(e[0].get("stockBefore")), num_of(e[0].get("stockAfter"))), (0.0, 5.0, 5.0));
+        let notes = clean_text(e[0].get("notes"));
+        assert!(notes.contains("Precio") && notes.contains("12") && notes.contains("Nombre") && notes.contains("Agua 1 L"), "{}", notes);
+        // guardar sin cambiar nada no registra nada
+        dispatch("save_product", &rec(12.0, "Agua 1 L", true), &t, &conn, &mut s).unwrap();
+        assert_eq!(movs_of(&conn, "edicion_producto").len(), 1);
+        // desactivar y activar en la caja
+        dispatch("save_product", &rec(12.0, "Agua 1 L", false), &t, &conn, &mut s).unwrap();
+        assert_eq!(movs_of(&conn, "producto_desactivado").len(), 1);
+        dispatch("save_product", &rec(12.0, "Agua 1 L", true), &t, &conn, &mut s).unwrap();
+        assert_eq!(movs_of(&conn, "producto_activado").len(), 1);
+        assert_eq!(movs_of(&conn, "edicion_producto").len(), 1, "activar no cuenta como edicion de datos");
+        // desde el panel: la caja anota el correo de quien lo pidio
+        let by = "dueno@correo.com";
+        assert_eq!(apply_command(&conn, &json!({"id":"88888888-aaaa-4bbb-8ccc-000000000001","type":"product_edit","payload":{"internal_id":"BEB-0001","before":{"cost":5.0},"after":{"cost":6.0},"by":by}})).0, "aplicado");
+        let pe: Vec<Value> = movs_of(&conn, "edicion_producto").into_iter().filter(|m| clean_text(m.get("user")) == format!("Panel: {}", by)).collect();
+        assert_eq!(pe.len(), 1);
+        assert!(clean_text(pe[0].get("notes")).contains("Costo"), "{}", clean_text(pe[0].get("notes")));
+        assert_eq!(apply_command(&conn, &json!({"id":"88888888-aaaa-4bbb-8ccc-000000000002","type":"product_active","payload":{"internal_id":"BEB-0001","active":false,"by":by}})).0, "aplicado");
+        assert!(movs_of(&conn, "producto_desactivado").iter().any(|m| clean_text(m.get("user")) == format!("Panel: {}", by)));
+        assert_eq!(apply_command(&conn, &json!({"id":"88888888-aaaa-4bbb-8ccc-000000000003","type":"product_create","payload":{"barcode":"999","name":"Papas","category":"Bebidas","cost":5.0,"price":9.0,"min_stock":1,"by":by}})).0, "aplicado");
+        let pa: Vec<Value> = movs_of(&conn, "alta_producto").into_iter().filter(|m| clean_text(m.get("user")) == format!("Panel: {}", by)).collect();
+        assert_eq!(pa.len(), 1);
+        assert_eq!(num_of(pa[0].get("quantity")), 0.0);
+        // una orden repetida no registra dos veces
+        apply_command(&conn, &json!({"id":"88888888-aaaa-4bbb-8ccc-000000000003","type":"product_create","payload":{"barcode":"999","name":"Papas","category":"Bebidas","cost":5.0,"price":9.0,"min_stock":1,"by":by}}));
+        assert_eq!(movs_of(&conn, "alta_producto").len(), 1);
+        // salidas y mermas piden motivo; la existencia nunca cambio por editar
+        assert_eq!(stock_of(&conn, "BEB-0001"), 5.0);
+        assert!(dispatch("movement", &json!({"sku":"BEB-0001","type":"merma","quantity":1}), &t, &conn, &mut s).unwrap_err().contains("motivo"));
+        assert_eq!(stock_of(&conn, "BEB-0001"), 5.0);
+        let m = dispatch("movement", &json!({"sku":"BEB-0001","type":"merma","quantity":1,"reason":"Caducado"}), &t, &conn, &mut s).unwrap();
+        assert_eq!(clean_text(m["movement"].get("reason")), "Caducado");
+        assert_eq!(stock_of(&conn, "BEB-0001"), 4.0);
+        // las entradas no piden motivo
+        dispatch("movement", &json!({"sku":"BEB-0001","type":"entrada_compra","quantity":1}), &t, &conn, &mut s).unwrap();
     }
 
     #[test]

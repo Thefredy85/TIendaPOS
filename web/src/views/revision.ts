@@ -1,5 +1,5 @@
 import type { Ctx } from '../main';
-import { listProducts, salesWithoutMoves, suspiciousProducts, type Product, type SaleWithoutMove, type SuspiciousProduct } from '../api';
+import { listProducts, salesWithoutMoves, stockWithoutSales, suspiciousProducts, type Product, type SaleWithoutMove, type StockWithoutSale, type SuspiciousProduct } from '../api';
 import { codeKey, daysAgoIso, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, rangeOf, todayIso } from '../ui';
 import { downloadXlsx } from '../xlsx';
 
@@ -29,7 +29,8 @@ export async function renderRevision(ctx: Ctx, el: HTMLElement) {
   let sections: Section[] = [];
   let seq = 0;
 
-  const build = (products: Product[], missing: SaleWithoutMove[], renamed: SuspiciousProduct[]): Section[] => {
+  const build = (products: Product[], missing: SaleWithoutMove[], renamed: SuspiciousProduct[], idle: StockWithoutSale[]): Section[] => {
+    const days = (ts: string) => Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 864e5));
     const groups = new Map<string, Product[]>();
     for (const p of products) { const k = codeKey(p.barcode); if (k) groups.set(k, [...(groups.get(k) ?? []), p]); }
     const dups = [...groups.values()].filter((g) => g.length > 1);
@@ -56,6 +57,13 @@ export async function renderRevision(ctx: Ctx, el: HTMLElement) {
         html: missing.map((m) => `<li><div class="grow"><div><b>${esc(m.name ?? 'Producto')}</b></div>
           <div class="small muted">${esc(fmtDateTime(m.ts))} · folio ${esc(m.sale_id)}</div></div><div class="right num">${fmtQty(m.qty)}</div></li>`).join(''),
         header: ['Fecha', 'Folio', 'Producto', 'Cantidad'], rows: missing.map((m) => [fmtDateTime(m.ts), m.sale_id, m.name, m.qty]) },
+      { key: 'idle', title: 'Llegó mercancía y no se ha vendido', count: idle.length,
+        help: 'Productos con entrada en el periodo y ninguna venta desde entonces. Cuéntalos: si en el estante ya no están, salieron sin pasar por la caja (sin escanear, cobrados con otro código, consumo o pérdida).',
+        html: idle.map((r) => `<li><div class="grow"><div><b>${esc(r.name ?? 'Sin nombre')}</b> <span class="small muted">${esc(r.barcode ?? 'sin código')}</span></div>
+          <div class="small muted">Entrada de ${fmtQty(r.last_in_qty)} el ${esc(fmtDateTime(r.last_in_ts))}${r.last_in_user ? ` (${esc(r.last_in_user)})` : ''} · hace ${days(r.last_in_ts)} días sin ventas${r.last_sale_ts ? ` · última venta ${esc(fmtDateTime(r.last_sale_ts))}` : ''}</div></div>
+          <div class="right num">${fmtQty(r.stock)}</div></li>`).join(''),
+        header: ['Código de barras', 'Producto', 'Categoría', 'Existencia en sistema', 'Última entrada', 'Cantidad', 'Registró', 'Días sin ventas', 'Última venta'],
+        rows: idle.map((r) => [r.barcode, r.name, r.category, r.stock, fmtDateTime(r.last_in_ts), r.last_in_qty, r.last_in_user, days(r.last_in_ts), r.last_sale_ts ? fmtDateTime(r.last_sale_ts) : '']) },
       { key: 'ren', title: 'Nombre distinto al de sus ventas', count: renamed.length,
         help: 'El nombre actual no coincide con el que tenía en ventas o movimientos. Puede ser un cambio de nombre normal o un producto pisado por la falla de v0.2.9 a v0.2.11 (al dar de alta uno nuevo se sobrescribía el que estaba en edición). Revisa cada caso; nada se corrige solo.',
         html: renamed.map((r) => `<li class="assign"><div class="grow"><div><b>${esc(r.name ?? 'Sin nombre')}</b> <span class="small muted">${esc(r.barcode ?? 'sin código')}</span></div>
@@ -79,10 +87,11 @@ export async function renderRevision(ctx: Ctx, el: HTMLElement) {
     out.innerHTML = '<div class="card empty">Revisando…</div>';
     try {
       const [f, t] = rangeOf(from.value, to.value);
-      const [products, missing, renamed] = await Promise.all([
-        listProducts(ctx.business.id), salesWithoutMoves(ctx.business.id, f, t), suspiciousProducts(ctx.business.id)]);
+      const [products, missing, renamed, idle] = await Promise.all([
+        listProducts(ctx.business.id), salesWithoutMoves(ctx.business.id, f, t), suspiciousProducts(ctx.business.id),
+        stockWithoutSales(ctx.business.id, f, t).catch(() => [] as StockWithoutSale[])]);
       if (my !== seq) return;
-      sections = build(products, missing, renamed);
+      sections = build(products, missing, renamed, idle);
       draw();
     } catch (e) {
       if (my === seq) out.innerHTML = `<div class="card empty">No se pudo revisar: ${esc((e as Error).message)}</div>`;

@@ -13,6 +13,9 @@ const TYPES: Record<string, string> = {
   eliminacion_movimiento: 'Eliminación de movimiento',
   alta_producto: 'Alta de producto',
   baja_producto: 'Producto eliminado',
+  edicion_producto: 'Cambio de datos del producto',
+  producto_activado: 'Producto activado',
+  producto_desactivado: 'Producto desactivado',
 };
 export const moveLabel = (t: string | null) => esc(TYPES[t ?? ''] ?? t ?? '—');
 
@@ -56,12 +59,13 @@ export async function renderMovimientos(ctx: Ctx, el: HTMLElement) {
       <div class="card kpi"><small>Movimientos</small><b>${shown.length}</b></div>
       <div class="card kpi"><small>Entradas</small><b>${sum(['entrada_compra'])}</b></div>
       <div class="card kpi"><small>Salidas y mermas</small><b>${sum(['salida_manual', 'merma'])}</b></div>
-      <div class="card kpi"><small>Altas, bajas y ajustes</small><b>${sum(['ajuste_conteo', 'eliminacion_movimiento', 'alta_producto', 'baja_producto'])}</b></div>`;
+      <div class="card kpi"><small>Altas, bajas, cambios y ajustes</small><b>${sum(['ajuste_conteo', 'eliminacion_movimiento', 'alta_producto', 'baja_producto', 'edicion_producto', 'producto_activado', 'producto_desactivado'])}</b></div>`;
     el.querySelector('#list')!.innerHTML = shown.length
       ? `<ul class="list card">${shown.slice(0, 400).map((m, i) => `<li class="click" data-i="${i}">
           <div class="grow"><div><b>${esc(m.product_name ?? m.internal_id ?? 'Producto')}</b>
             ${m.voided_at ? '<span class="pill off">anulado</span>' : ''}</div>
-            <div class="small muted">${moveLabel(m.type)} · ${fmtDateTime(m.ts)} · ${esc(m.user_name ?? '—')}${m.authorized_by && m.authorized_by !== m.user_name ? `, autorizó ${esc(m.authorized_by)}` : ''}</div></div>
+            <div class="small muted">${moveLabel(m.type)} · ${fmtDateTime(m.ts)} · ${esc(m.user_name ?? '—')}${m.authorized_by && m.authorized_by !== m.user_name ? `, autorizó ${esc(m.authorized_by)}` : ''}</div>
+            ${m.reason || m.notes ? `<div class="small">${esc([m.type === 'venta' ? '' : m.reason, m.notes].filter(Boolean).join(' · '))}</div>` : ''}</div>
           <div class="right num">${moveQty(m)}<div class="small muted">${fmtQty(m.stock_before)} → ${fmtQty(m.stock_after)}</div></div></li>`).join('')}</ul>
         ${shown.length > 400 ? `<p class="small muted">Se muestran 400 de ${shown.length}. Acota las fechas o descarga el CSV.</p>` : ''}
         ${moves.length >= LIMIT ? `<p class="small muted">Se cargaron los ${LIMIT} más recientes del rango. Acota las fechas para ver los anteriores.</p>` : ''}`
