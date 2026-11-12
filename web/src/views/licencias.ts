@@ -3,7 +3,7 @@ import {
   getPolicy, licRegisterPayment, licSetContact, licSetEnforce, licSetMinVersion, licUnlockCode, licUpsert,
   listBusinesses, listLicenses, listPayments, type Business, type License,
 } from '../api';
-import { esc, fmtDate, fmtDateTime, fmtMoney, icon, openSheet, paintIcons, toast } from '../ui';
+import { askConfirm, esc, fmtDate, fmtDateTime, fmtMoney, icon, openSheet, paintIcons, toast } from '../ui';
 import { firstCutDate, licenseState, localIso } from '../licencia-fechas';
 
 const PILL = { none: 'off', ok: 'ok', soon: 'wait', expired: 'wait', suspended: 'bad' } as const;
@@ -64,7 +64,7 @@ export async function renderLicencias(ctx: Ctx, el: HTMLElement) {
     };
     el.querySelector<HTMLButtonElement>('#save-minver')!.onclick = async () => {
       const v = el.querySelector<HTMLInputElement>('#f-minver')!.value.trim();
-      if (v && !confirm(`¿Fijar la versión mínima en ${v}?\n\nLas cajas con una versión más vieja verán un aviso por 7 días y después se suspenderán (solo en negocios con el bloqueo encendido).`)) return;
+      if (v && !await askConfirm(`¿Fijar la versión mínima en ${v}?\n\nLas cajas con una versión más vieja verán un aviso por 7 días y después se suspenderán (solo en negocios con el bloqueo encendido).`)) return;
       try { await licSetMinVersion(v || null); toast(v ? 'Versión mínima guardada' : 'Sin versión mínima'); await draw(); } catch (e) { toast((e as Error).message); }
     };
     el.querySelectorAll<HTMLButtonElement>('button[data-act]').forEach((btn) => {
@@ -129,7 +129,7 @@ const actions = {
       e.preventDefault();
       const amount = Number(form.querySelector<HTMLInputElement>('#f-amount')!.value);
       if (!(amount >= 0)) { form.querySelector('.err')!.textContent = 'Revisa el monto.'; return; }
-      if (!confirm(`¿Registrar el pago de ${fmtMoney(amount)} de ${b.name || b.license_key}?`)) return;
+      if (!await askConfirm(`¿Registrar el pago de ${fmtMoney(amount)} de ${b.name || b.license_key}?`)) return;
       try {
         const r = await licRegisterPayment(b.id, amount, form.querySelector<HTMLSelectElement>('#f-method')!.value, form.querySelector<HTMLInputElement>('#f-notes')!.value.trim() || null);
         document.querySelector('.sheet-bg')?.remove();
@@ -144,7 +144,7 @@ const actions = {
     const msg = on
       ? `¿Encender el bloqueo de ${b.name || b.license_key}?\n\nSi no paga a tiempo, la tienda dejará de poder vender desde el día de corte (con 3 días de gracia si no tiene internet). Sus ventas e inventario no se tocan.`
       : `¿Apagar el bloqueo de ${b.name || b.license_key}?\n\nLa tienda solo verá avisos; nunca se suspenderá.`;
-    if (!confirm(msg)) return;
+    if (!await askConfirm(msg)) return;
     try { await licSetEnforce(b.id, on); toast(on ? 'Bloqueo encendido' : 'Bloqueo apagado'); await redraw(); } catch (e) { toast((e as Error).message); }
   },
 

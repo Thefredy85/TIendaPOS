@@ -1,6 +1,6 @@
 import type { Ctx } from '../main';
 import { listDevices, setDeviceStatus, type Device } from '../api';
-import { ago, esc, fmtDateTime, fmtMoney, fmtTime, icon, paintIcons, toast } from '../ui';
+import { askConfirm, ago, esc, fmtDateTime, fmtMoney, fmtTime, icon, paintIcons, toast } from '../ui';
 
 // La caja manda su latido cada minuto: 3 minutos sin latido = sin conexión.
 const ONLINE_MS = 3 * 60 * 1000;
@@ -27,7 +27,7 @@ export async function changeStatus(d: Device, status: 'aprobado' | 'revocado'): 
   const msg = status === 'aprobado'
     ? `¿Aprobar "${deviceName(d)}"?\n\nPodrá enviar ventas, inventario y cortes de este negocio. Aprueba solo si reconoces este equipo.`
     : `¿Dar de baja "${deviceName(d)}"?\n\nDejará de enviar datos a la nube. Lo que ya envió se conserva.`;
-  if (!confirm(msg)) return false;
+  if (!await askConfirm(msg)) return false;
   try {
     await setDeviceStatus(d.id, status);
     toast(status === 'aprobado' ? 'Caja aprobada' : 'Caja dada de baja');

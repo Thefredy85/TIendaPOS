@@ -79,6 +79,33 @@ export function openSheet(title: string, bodyHtml: string): HTMLElement {
   return bg.querySelector('.sheet-body') as HTMLElement;
 }
 
+// Confirmación dentro de la página (la del navegador, confirm(), no aparece en algunos
+// navegadores integrados y en ellos siempre contestaba "No"). La primera línea del
+// mensaje va como título; el resto como texto. Enter acepta y Escape cancela.
+export function askConfirm(message: string, accept = 'Sí, continuar'): Promise<boolean> {
+  return new Promise((resolve) => {
+    const [head, ...rest] = message.split('\n');
+    const text = rest.join('\n').trim();
+    const bg = document.createElement('div');
+    bg.className = 'confirm-bg';
+    bg.innerHTML = `<div class="confirm-box" role="alertdialog" aria-modal="true" aria-label="${esc(head)}">
+      <p class="confirm-title">${esc(head)}</p>
+      ${text ? `<p class="confirm-text">${esc(text).replace(/\n/g, '<br>')}</p>` : ''}
+      <div class="modal-actions"><button class="btn" data-no>Cancelar</button><button class="btn primary" data-yes>${esc(accept)}</button></div></div>`;
+    const done = (v: boolean) => { bg.remove(); document.removeEventListener('keydown', onKey, true); resolve(v); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); done(false); }
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(true); }
+    };
+    bg.addEventListener('click', (e) => { if (e.target === bg) done(false); });
+    bg.querySelector('[data-no]')!.addEventListener('click', () => done(false));
+    bg.querySelector('[data-yes]')!.addEventListener('click', () => done(true));
+    document.addEventListener('keydown', onKey, true);
+    document.body.append(bg);
+    bg.querySelector<HTMLButtonElement>('[data-yes]')!.focus();
+  });
+}
+
 // Mismo criterio que la app (codeKey en src/index.html, norm_code en main.rs): solo letras y números, sin ceros a la izquierda
 export const codeKey = (v: unknown) => String(v ?? '').replace(/[^0-9a-z]/gi, '').toUpperCase().replace(/^0+/, '');
 

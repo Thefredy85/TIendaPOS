@@ -1,6 +1,6 @@
 import type { Ctx } from '../main';
 import { addMember, createAccount, listAllDevices, listBusinesses, listLicenses, listUnassignedAccounts, salesSince, type Business, type Device, type UnassignedAccount } from '../api';
-import { dayRange, esc, fmtDate, fmtMoney, fmtToday, icon, paintIcons, todayIso, toast } from '../ui';
+import { askConfirm, dayRange, esc, fmtDate, fmtMoney, fmtToday, icon, paintIcons, todayIso, toast } from '../ui';
 import { licenseState, localIso } from '../licencia-fechas';
 import { deviceName, deviceState } from './cajas';
 import { askResetPassword, showCredentials, tempPassword } from './cuentas-ui';
@@ -95,7 +95,7 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
       const password = field<HTMLInputElement>('na-pass').value;
       const store = field<HTMLSelectElement>('na-store');
       const access = field<HTMLSelectElement>('na-role');
-      if (!confirm(`¿Crear la cuenta ${email} con acceso de ${access.selectedOptions[0].text} en "${store.selectedOptions[0].text}"?`)) return;
+      if (!await askConfirm(`¿Crear la cuenta ${email} con acceso de ${access.selectedOptions[0].text} en "${store.selectedOptions[0].text}"?`)) return;
       const btn = form.querySelector<HTMLButtonElement>('button[type=submit]')!;
       btn.disabled = true;
       try {
@@ -147,7 +147,7 @@ export async function renderTiendas(ctx: Ctx, el: HTMLElement) {
         const name = store.selectedOptions[0].text;
         const role = access.value as 'owner' | 'gestor';
         const warn = a.confirmed ? '' : '\n\nOjo: esta persona todavía no confirma su correo.';
-        if (!confirm(`¿Dar acceso de ${access.selectedOptions[0].text} a ${a.email} en "${name}"?${warn}`)) return;
+        if (!await askConfirm(`¿Dar acceso de ${access.selectedOptions[0].text} a ${a.email} en "${name}"?${warn}`)) return;
         btn.disabled = true;
         try {
           await addMember(store.value, a.email, role);

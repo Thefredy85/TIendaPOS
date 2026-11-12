@@ -1,6 +1,6 @@
 import type { Ctx } from '../main';
 import { addMember, getRolePermissions, listMembers, listPosUsers, removeMember, type Member, type PosUser, type RolePermissions } from '../api';
-import { esc, fmtDate, icon, paintIcons, toast } from '../ui';
+import { askConfirm, esc, fmtDate, icon, paintIcons, toast } from '../ui';
 import { askResetPassword } from './cuentas-ui';
 
 // Mismas etiquetas que la pantalla de Permisos de la app (PERM_LABELS en src/index.html)
@@ -89,7 +89,7 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
     e.preventDefault();
     const email = box.querySelector<HTMLInputElement>('#m-email')!.value.trim();
     const role = box.querySelector<HTMLSelectElement>('#m-role')!.value as 'owner' | 'gestor';
-    if (!confirm(`¿Dar acceso de ${MEMBER_LABEL[role]} a ${email} en "${ctx.business.name || ctx.business.license_key}"?`)) return;
+    if (!await askConfirm(`¿Dar acceso de ${MEMBER_LABEL[role]} a ${email} en "${ctx.business.name || ctx.business.license_key}"?`)) return;
     try {
       await addMember(ctx.business.id, email, role);
       toast('Acceso agregado');
@@ -110,7 +110,7 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
     s.onchange = async () => {
       const m = members.find((x) => x.user_id === s.dataset.role)!;
       const role = s.value as Member['role'];
-      if (!confirm(`¿Cambiar a ${m.email} de ${MEMBER_LABEL[m.role]} a ${MEMBER_LABEL[role]}?`)) { s.value = m.role; return; }
+      if (!await askConfirm(`¿Cambiar a ${m.email} de ${MEMBER_LABEL[m.role]} a ${MEMBER_LABEL[role]}?`)) { s.value = m.role; return; }
       s.disabled = true;
       try {
         await addMember(ctx.business.id, m.email, role);
@@ -126,7 +126,7 @@ async function drawMembers(ctx: Ctx, box: HTMLElement) {
   box.querySelectorAll<HTMLButtonElement>('[data-remove]').forEach((b) => {
     b.onclick = async () => {
       const m = members.find((x) => x.user_id === b.dataset.remove)!;
-      if (!confirm(`¿Quitar el acceso de ${m.email}?\n\nYa no podrá ver este negocio en el panel. Su cuenta no se borra.`)) return;
+      if (!await askConfirm(`¿Quitar el acceso de ${m.email}?\n\nYa no podrá ver este negocio en el panel. Su cuenta no se borra.`)) return;
       try {
         await removeMember(ctx.business.id, m.user_id);
         toast('Acceso quitado');

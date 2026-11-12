@@ -1,5 +1,5 @@
 import { resetAccountPassword } from '../api';
-import { esc, toast } from '../ui';
+import { askConfirm, esc, toast } from '../ui';
 
 // Sin letras ni números que se confundan al dictarla por teléfono
 const ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -30,7 +30,7 @@ export function showCredentials(title: string, email: string, password: string) 
 }
 
 export async function askResetPassword(userId: string, email: string) {
-  if (!confirm(`¿Poner una contraseña temporal a ${email}?\n\nSu contraseña actual dejará de servir.`)) return;
+  if (!await askConfirm(`¿Poner una contraseña temporal a ${email}?\n\nSu contraseña actual dejará de servir.`)) return;
   const password = tempPassword();
   try {
     await resetAccountPassword(userId, password);

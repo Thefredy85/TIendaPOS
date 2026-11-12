@@ -1,6 +1,6 @@
 import type { Ctx } from '../main';
 import { cancelChange, editProduct, listDevices, listProducts, recentChanges, stockMove, type MoveType, type ProductFields, type RemoteChange } from '../api';
-import { ago, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, toast } from '../ui';
+import { askConfirm, ago, esc, fmtDateTime, fmtMoney, fmtQty, icon, paintIcons, toast } from '../ui';
 
 // Primera versión de la app que aplica las órdenes del panel
 export const MIN_EDIT_VERSION = '0.2.15';
@@ -106,24 +106,24 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
       await draw();
     };
     el.querySelectorAll<HTMLButtonElement>('[data-cancel]').forEach((b) => {
-      b.onclick = () => {
-        if (confirm('¿Retirar este cambio? La caja ya no lo aplicará.')) void act(() => cancelChange(b.dataset.cancel!), 'Cambio cancelado');
+      b.onclick = async () => {
+        if (await askConfirm('¿Retirar este cambio? La caja ya no lo aplicará.')) void act(() => cancelChange(b.dataset.cancel!), 'Cambio cancelado');
       };
     });
     el.querySelectorAll<HTMLButtonElement>('[data-undo]').forEach((b) => {
-      b.onclick = () => {
+      b.onclick = async () => {
         const c = changes.find((x) => x.id === b.dataset.undo)!;
         if (c.type === 'stock_move') {
           const back: MoveType = c.payload.type === 'entrada_compra' ? 'salida_manual' : 'entrada_compra';
           const q = Number(c.payload.quantity ?? 0);
-          if (!confirm(`¿Deshacer este movimiento de "${title(c)}"?
+          if (!await askConfirm(`¿Deshacer este movimiento de "${title(c)}"?
 
 Se enviará ${MOVE_TEXT[back].toLowerCase()} de ${fmtQty(q)} para compensarlo.`)) return;
           void act(() => stockMove(ctx.business.id, c.payload.internal_id, back, q, `Deshacer: ${c.payload.reason ?? ''}`.slice(0, 200), c.id), 'Enviado a la caja');
           return;
         }
         const lines = changedKeys(c.payload.after).map((k) => `${FIELD_LABEL[k]}: ${fieldValue(k, c.payload.after[k])} → ${fieldValue(k, c.payload.before[k])}`).join('\n');
-        if (!confirm(`¿Deshacer este cambio de "${names.get(c.payload.internal_id) ?? 'producto'}"?\n\n${lines}`)) return;
+        if (!await askConfirm(`¿Deshacer este cambio de "${names.get(c.payload.internal_id) ?? 'producto'}"?\n\n${lines}`)) return;
         const before = Object.fromEntries(changedKeys(c.payload.after).map((k) => [k, c.payload.before[k]])) as ProductFields;
         void act(() => editProduct(ctx.business.id, c.payload.internal_id, c.payload.after, before, c.id), 'Enviado a la caja');
       };

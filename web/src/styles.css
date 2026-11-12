@@ -195,3 +195,9 @@ a { color: var(--accent); }
 .edit-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
 .edit-form input, .edit-form select { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 9px 10px; font-size: 16px; width: 100%; }
 .edit-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+/* Confirmación dentro de la página (askConfirm) */
+.confirm-bg { position: fixed; inset: 0; background: rgba(23, 33, 29, .45); z-index: 40; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.confirm-box { background: var(--panel); border-radius: 12px; width: min(420px, 100%); padding: 18px 18px 16px; box-shadow: 0 12px 40px rgba(0, 0, 0, .25); }
+.confirm-title { margin: 0 0 8px; font-weight: 600; font-size: 16px; }
+.confirm-text { margin: 0 0 16px; color: var(--muted); font-size: 14px; line-height: 1.45; }
