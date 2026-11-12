@@ -78,7 +78,8 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
     const undone = new Set(changes.filter((c) => c.status !== 'cancelado' && c.status !== 'rechazado').map((c) => c.payload.undo_of).filter(Boolean));
     const busy = new Set(changes.filter((c) => c.status === 'pendiente' && c.type === 'product_edit').map((c) => c.payload.internal_id));
     // Se deshacen cambios de datos (si no hay otro esperando) y movimientos (con el movimiento contrario)
-    const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id)
+    // Un "deshacer" no se puede deshacer: se encadenaría sin querer. Para volver al valor, se edita de nuevo.
+    const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id) && !c.payload.undo_of
       && (c.type === 'stock_move' || (c.type === 'product_edit' && !busy.has(c.payload.internal_id)));
     const title = (c: RemoteChange) => c.type === 'product_create' || c.type === 'catalog_save' ? (c.payload.name ?? 'Producto nuevo')
       : names.get(c.payload.internal_id) ?? 'Producto ya no disponible';
