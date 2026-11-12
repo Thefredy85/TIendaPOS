@@ -128,9 +128,16 @@ async function selectBusiness(business: Business) {
     },
     setAlertCount: (n) => { alertCount = n; paintAlertBadge(); },
   };
+  // Una venta llega como varios avisos (la venta y un movimiento por renglón) y la carga
+  // inicial de una caja como cientos: se juntan por tabla y la vista se refresca una vez.
+  const pending = new Map<string, number>();
   stopWatch = watchBusiness(business.id, (table) => {
-    listeners.forEach((fn) => fn(table));
-    if (table === 'pos_devices') void refreshBadge();
+    if (pending.has(table)) return;
+    pending.set(table, window.setTimeout(() => {
+      pending.delete(table);
+      listeners.forEach((fn) => fn(table));
+      if (table === 'pos_devices') void refreshBadge();
+    }, 1200));
   });
   render();
   void refreshAlerts();
@@ -161,7 +168,10 @@ function shell(current: string): string {
     <main class="main">
       <div class="top">
         <div><h1>${heading}</h1><div class="sub" id="sub"></div></div>
-        ${businesses.length > 1 && !allStores ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          ${businesses.length > 1 && !allStores ? `<select class="biz-select" id="biz" aria-label="Negocio">${options}</select>` : ''}
+          <button class="btn top-logout" id="logout-top" title="${esc(email)}">${icon('log-out')} Salir</button>
+        </div>
       </div>
       <div id="view"></div>
     </main>
@@ -175,6 +185,7 @@ function render() {
   app.innerHTML = shell(current);
   paintIcons();
   document.getElementById('logout')!.onclick = logout;
+  document.getElementById('logout-top')!.onclick = logout;
   const biz = document.getElementById('biz') as HTMLSelectElement | null;
   if (biz) biz.onchange = () => selectBusiness(businesses.find((b) => b.id === biz.value)!);
   void refreshBadge();
