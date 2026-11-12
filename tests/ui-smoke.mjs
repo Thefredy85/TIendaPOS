@@ -406,7 +406,8 @@ async function main() {
 
     // Falla reportada: "a veces no se descuentan los productos" y "toma mal los códigos".
     console.log('\n8) Método de descuento: ceros a la izquierda, códigos repetidos y productos sin existencia');
-    await seed([product('DUP-0001', '0750100', 'Galleta A', 10, 3), product('DUP-0002', '750100', 'Galleta B', 11, 4), product('CERO-001', '555', 'Chicle', 5, 0)]);
+    // NEG-001 viene de una versión vieja (ya estaba en negativo): el diagnóstico lo sigue mostrando
+    await seed([product('DUP-0001', '0750100', 'Galleta A', 10, 3), product('DUP-0002', '750100', 'Galleta B', 11, 4), product('CERO-001', '555', 'Chicle', 5, 0), product('NEG-001', '556', 'Mazapán', 4, -2)]);
     ({ page, errors, context } = await newPage(browser));
     await page.evaluate(fakePrint);
     await login(page);
@@ -422,26 +423,51 @@ async function main() {
     await page.click('[data-dup-sell="DUP-0002"]');
     await page.waitForTimeout(300);
     check(await page.evaluate(() => state.cart.some((l) => l.sku === 'DUP-0002') && !state.cart.some((l) => l.sku === 'DUP-0001')), '8) se vende el producto elegido, no el primero de la lista');
+    // v0.2.18: lo que no hay NO se vende (antes se vendía y quedaba en negativo)
     await scan('555');
-    check(await page.evaluate(() => state.cart.some((l) => l.sku === 'CERO-001')), '8) un producto sin existencia se puede vender');
-    check((await page.locator('#lowStockDialog[open]').count()) > 0, '8) avisa "inventario bajo" al agregar un producto sin existencia');
-    await page.click('#lowStockOkBtn').catch(() => {});   // el cajero pulsa Entendido
-    await page.waitForTimeout(200);
+    check((await page.locator('#noStockDialog[open]').count()) > 0, '8) un producto sin existencia abre la ventana "Sin existencia"');
+    check(await page.evaluate(() => !state.cart.some((l) => l.sku === 'CERO-001')), '8) un producto sin existencia NO entra al ticket');
+    await page.click('#cancelNoStockBtn');
+    await scan('556');
+    check(await page.evaluate(() => !state.cart.some((l) => l.sku === 'NEG-001')), '8) un producto en negativo tampoco se vende');
+    await page.click('#cancelNoStockBtn').catch(() => {});
     await pay(page);
     await page.waitForSelector('#receiptDialog[open]', { timeout: 8000 }).catch(() => {});
     await page.click('#closeReceiptBtn').catch(() => {});
     await page.waitForTimeout(800);
     const s8 = [await stock('BEB-0001'), await stock('DUP-0002'), await stock('CERO-001')];
-    check(JSON.stringify(s8) === JSON.stringify([9, 3, -1]), '8) cada producto se descuenta exacto en la base (Agua 9, Galleta B 3, Chicle -1)', JSON.stringify(s8));
+    check(JSON.stringify(s8) === JSON.stringify([9, 3, 0]), '8) cada producto se descuenta exacto en la base (Agua 9, Galleta B 3, Chicle sigue en 0)', JSON.stringify(s8));
     check((await stock('DUP-0001')) === 3, '8) el otro producto con el código repetido no se toca');
     const shown8 = await page.evaluate(() => ['BEB-0001', 'DUP-0002', 'CERO-001'].map((s) => state.products.find((p) => p.sku === s)?.stock));
-    check(JSON.stringify(shown8) === JSON.stringify([9, 3, -1]), '8) la pantalla muestra las existencias ya descontadas', JSON.stringify(shown8));
-    try { await toastHas(page, 'Quedaron en negativo', 4000); ok('8) avisa qué productos quedaron en negativo'); } catch { bad('8) avisa qué productos quedaron en negativo'); }
+    check(JSON.stringify(shown8) === JSON.stringify([9, 3, 0]), '8) la pantalla muestra las existencias ya descontadas', JSON.stringify(shown8));
     await page.evaluate(() => openDiagnostics());
     await page.waitForSelector('#diagDialog[open]', { timeout: 5000 }).catch(() => {});
     const diagText = await page.locator('#diagBody').innerText().catch(() => '');
-    check(/Códigos repetidos \(1\)/.test(diagText) && /Existencia negativa \(1\)/.test(diagText), '8) el diagnóstico muestra el código repetido y la existencia negativa', diagText.slice(0, 160));
-    check((await stock('DUP-0001')) === 3 && (await stock('DUP-0002')) === 3 && (await stock('CERO-001')) === -1, '8) el diagnóstico no corrige nada solo');
+    check(/Códigos repetidos \(1\)/.test(diagText) && /Existencia negativa \(1\)/.test(diagText), '8) el diagnóstico muestra el código repetido y la existencia negativa que ya había', diagText.slice(0, 160));
+    check((await stock('DUP-0001')) === 3 && (await stock('DUP-0002')) === 3 && (await stock('NEG-001')) === -2, '8) el diagnóstico no corrige nada solo');
+    await page.click('#closeDiagBtn').catch(() => {});
+
+    // 8b) Llegó mercancía: se registra la entrada desde la misma ventana y se vende
+    await scan('555');
+    await page.waitForSelector('#noStockDialog[open]', { timeout: 4000 });
+    await page.fill('#noStockQty', '4');
+    await page.click('#noStockForm button[type="submit"]');
+    await page.waitForFunction(() => state.cart.some((l) => l.sku === 'CERO-001'), null, { timeout: 6000 }).catch(() => {});
+    check((await stock('CERO-001')) === 4, '8b) "Registrar entrada" suma lo que llegó en la base', String(await stock('CERO-001')));
+    check(await page.evaluate(() => state.cart.some((l) => l.sku === 'CERO-001' && l.qty === 1)), '8b) y el producto entra al ticket');
+    const ent8 = (await call('history', { kind: 'moves', from: '2000-01-01T00:00:00Z', to: '' }, (await call('login', { code: '1234' })).sessionToken)).rows.filter((m) => m.sku === 'CERO-001');
+    check(ent8.length === 1 && ent8[0].type === 'entrada_compra' && ent8[0].quantity === 4 && ent8[0].stockBefore === 0 && ent8[0].stockAfter === 4, '8b) queda su movimiento de entrada (0 -> 4)', JSON.stringify(ent8.map((m) => [m.type, m.quantity])));
+    // 8c) Mientras el ticket esperaba alguien sacó la mercancía: al cobrar se rechaza todo
+    const chicle = await call('__test_get_product', { sku: 'CERO-001' });
+    await call('__test_put_product', { ...chicle, stock: 0 });
+    const sales8 = await page.evaluate(() => state.sales.length);
+    await pay(page);
+    await page.waitForSelector('#noStockDialog[open]', { timeout: 6000 }).catch(() => {});
+    check((await page.locator('#noStockDialog[open]').count()) > 0, '8c) al cobrar sin existencia avisa y ofrece registrar la entrada');
+    check((await stock('CERO-001')) === 0, '8c) la base no descuenta nada');
+    check(await page.evaluate((n) => state.sales.length === n && state.cart.length > 0, sales8), '8c) no se guarda la venta y el ticket sigue ahí');
+    await page.click('#cancelNoStockBtn').catch(() => {});
+    await page.evaluate(() => { state.cart = []; clearCartDraft(); renderCart(); show('pos'); });
     await page.click('#closeDiagBtn').catch(() => {});
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
@@ -757,6 +783,77 @@ async function main() {
       check(await page.evaluate(() => state.view === 'cashcut'), '11g) F10 abre el corte de caja');
       await page.evaluate(() => show('pos'));
     }
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    console.log('\n14) Sin existencia con un cajero: la entrada pide el PIN de un encargado o administrador');
+    await seed([product('CERO-002', '557', 'Paleta', 6, 0)]);
+    const boss14 = await call('login', { code: '1234' });
+    await call('save_user', { username: '2001', password: '2001', displayName: 'Ana', role: 'cajero' }, boss14.sessionToken);
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await page.fill('#authCode', '2001');
+    await page.press('#authCode', 'Enter');
+    await page.waitForFunction(() => !document.body.classList.contains('locked'), null, { timeout: 8000 });
+    await openCash(page);
+    await page.fill('#scanInput', '557');
+    await page.press('#scanInput', 'Enter');
+    await page.waitForSelector('#noStockDialog[open]', { timeout: 4000 }).catch(() => {});
+    check((await page.locator('#noStockDialog[open]').count()) > 0, '14) el cajero ve "Sin existencia"');
+    await page.fill('#noStockQty', '2');
+    await page.click('#noStockForm button[type="submit"]');
+    await page.waitForSelector('#supervisorDialog[open]', { timeout: 4000 }).catch(() => {});
+    check((await page.locator('#supervisorDialog[open]').count()) > 0, '14) pide el PIN de un encargado o administrador');
+    await page.fill('#supervisorCode', '2001');
+    await page.press('#supervisorCode', 'Enter');
+    await page.waitForTimeout(900);
+    check((await stock('CERO-002')) === 0, '14) el PIN de un cajero no autoriza la entrada');
+    await page.fill('#supervisorCode', '1234');
+    await page.press('#supervisorCode', 'Enter');
+    await page.waitForFunction(() => state.cart.some((l) => l.sku === 'CERO-002'), null, { timeout: 6000 }).catch(() => {});
+    check((await stock('CERO-002')) === 2, '14) con el PIN del administrador entra la mercancía', String(await stock('CERO-002')));
+    const m14 = (await call('history', { kind: 'moves', from: '2000-01-01T00:00:00Z', to: '' }, boss14.sessionToken)).rows.filter((m) => m.sku === 'CERO-002');
+    check(m14.length === 1 && m14[0].user === 'Ana' && m14[0].authorizedBy === 'Admin', '14) el movimiento dice quién la registró y quién autorizó', JSON.stringify(m14.map((m) => [m.user, m.authorizedBy])));
+    if (await page.locator('#lowStockDialog[open]').count()) await page.click('#lowStockOkBtn'); // queda 1: aviso de inventario bajo
+    await pay(page);
+    await page.waitForSelector('#receiptDialog[open]', { timeout: 8000 }).catch(() => {});
+    await page.click('#closeReceiptBtn').catch(() => {});
+    await page.waitForTimeout(600);
+    check((await stock('CERO-002')) === 1, '14) se cobra y descuenta exacto (2 -> 1)');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
+    // Falla reportada: F2/F4 tardaban varios segundos con meses de historial
+    console.log('\n15) Rapidez: F2 y F4 con 470 productos y 5,000 movimientos');
+    await call('__test_reset');
+    for (let i = 0; i < 470; i++) await call('__test_put_product', product('V' + (1000 + i), String(7500000000000 + i), 'Producto ' + i, 10, 5));
+    await call('__test_bulk_moves', { n: 5000, sku: 'V1000' });
+    ({ page, errors, context } = await newPage(browser));
+    await login(page);
+    await openCash(page).catch(() => {});
+    const timeKey = async (key, sel) => {
+      const t = Date.now();
+      await page.keyboard.press(key);
+      await page.waitForSelector(sel + ':not(.hide)', { timeout: 30000 });
+      await page.waitForFunction(() => !document.querySelector('#movesTable') || state.view !== 'movements' || document.querySelectorAll('#movesTable tbody tr').length > 0, null, { timeout: 30000 });
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      return Date.now() - t;
+    };
+    await timeKey('F4', '#view-movements'); // la primera vez trae el historial de 30 días (en segundo plano)
+    await page.waitForFunction(() => state.range && state.range.moves && state.range.moves.key && !state.range.moves.pendingKey, null, { timeout: 30000 });
+    await timeKey('F1', '#view-pos');
+    const t15 = [];
+    for (let i = 0; i < 3; i++) { t15.push(await timeKey('F4', '#view-movements')); t15.push(await timeKey('F2', '#view-design')); await timeKey('F1', '#view-pos'); }
+    check(Math.max(...t15) < 1500, `15) F4 y F2 abren rápido (máximo ${Math.max(...t15)} ms)`, JSON.stringify(t15));
+    await page.keyboard.press('F4');
+    await page.waitForSelector('#view-movements:not(.hide)');
+    const rows15 = await page.locator('#movesTable tbody tr').count();
+    check(rows15 === 200, '15) Movimientos dibuja las 200 filas más recientes', String(rows15));
+    check(await page.evaluate(() => document.querySelectorAll('#productsTable tbody tr').length === 0), '15) no dibuja la tabla de productos que no se ve');
+    await page.click('[data-more-rows="moves"]');
+    check((await page.locator('#movesTable tbody tr').count()) === 400, '15) "Mostrar más" agrega 200 filas');
+    const csv15 = await page.evaluate(() => rangeRows('moves', state.moves).length);
+    check(csv15 >= 4000, '15) el historial completo del periodo sigue disponible (filtro y archivo)', String(csv15));
     check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
     await context.close();
   } finally {

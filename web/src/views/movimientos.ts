@@ -11,6 +11,8 @@ const TYPES: Record<string, string> = {
   venta: 'Venta',
   devolucion_venta: 'Devolución de venta',
   eliminacion_movimiento: 'Eliminación de movimiento',
+  alta_producto: 'Alta de producto',
+  baja_producto: 'Producto eliminado',
 };
 export const moveLabel = (t: string | null) => esc(TYPES[t ?? ''] ?? t ?? '—');
 
@@ -54,7 +56,7 @@ export async function renderMovimientos(ctx: Ctx, el: HTMLElement) {
       <div class="card kpi"><small>Movimientos</small><b>${shown.length}</b></div>
       <div class="card kpi"><small>Entradas</small><b>${sum(['entrada_compra'])}</b></div>
       <div class="card kpi"><small>Salidas y mermas</small><b>${sum(['salida_manual', 'merma'])}</b></div>
-      <div class="card kpi"><small>Ajustes y eliminaciones</small><b>${sum(['ajuste_conteo', 'eliminacion_movimiento'])}</b></div>`;
+      <div class="card kpi"><small>Altas, bajas y ajustes</small><b>${sum(['ajuste_conteo', 'eliminacion_movimiento', 'alta_producto', 'baja_producto'])}</b></div>`;
     el.querySelector('#list')!.innerHTML = shown.length
       ? `<ul class="list card">${shown.slice(0, 400).map((m, i) => `<li class="click" data-i="${i}">
           <div class="grow"><div><b>${esc(m.product_name ?? m.internal_id ?? 'Producto')}</b>
