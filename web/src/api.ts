@@ -296,11 +296,12 @@ export async function productMovements(businessId: string, internalId: string, l
 
 // ---------- usuarios del POS y permisos (solo lectura) ----------
 
-export interface PosUser { username: string; display_name: string | null; role: string | null; active: boolean | null }
+// Sin el usuario: en la caja el usuario ES el PIN de acceso, y no debe mostrarse ni descargarse.
+export interface PosUser { display_name: string | null; role: string | null; active: boolean | null }
 export type RolePermissions = Record<string, Record<string, boolean>>;
 
 export async function listPosUsers(businessId: string): Promise<PosUser[]> {
-  return check(await sb.from('pos_users').select('username, display_name, role, active')
+  return check(await sb.from('pos_users').select('display_name, role, active')
     .eq('business_id', businessId).is('deleted_at', null).order('display_name'));
 }
 

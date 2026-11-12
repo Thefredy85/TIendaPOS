@@ -30,8 +30,7 @@ export async function renderUsuarios(ctx: Ctx, el: HTMLElement) {
   el.innerHTML = `
     <div class="section-title" style="margin-top:0">${icon('users')} Usuarios de la caja</div>
     ${users.length ? `<ul class="list card">${users.map((u) => `<li>
-        <div class="grow"><div><b>${esc(u.display_name || u.username)}</b></div>
-          <div class="small muted">Usuario ${esc(u.username)}</div></div>
+        <div class="grow"><div><b>${esc(u.display_name || 'Sin nombre')}</b></div></div>
         <span class="pill ${u.role === 'admin' ? 'ok' : 'off'}">${esc(ROLE_LABEL[u.role ?? ''] ?? u.role ?? '—')}</span>
         ${u.active === false ? '<span class="pill bad">Inactivo</span>' : ''}</li>`).join('')}</ul>`
       : '<div class="card empty small">La caja aún no ha enviado sus usuarios.</div>'}
