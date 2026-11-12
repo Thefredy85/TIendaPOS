@@ -560,6 +560,48 @@ async function main() {
     check(/Avísale al encargado/.test(bannerC) && !/Monto/.test(bannerC), '12) el cajero ve "Avísale al encargado" (sin montos)', bannerC);
     await context.close();
 
+    // v0.2.17: usuarios de la caja desde el panel. El PIN llega dentro de la orden y se aplica en la caja.
+    console.log('\n13) Usuarios desde el panel: PIN nuevo, rol y desactivar; cobro y corte siguen igual');
+    await seed();
+    const boss13 = await call('login', { code: '1234' });
+    await call('save_user', { username: '2001', password: '2001', displayName: 'Ana', role: 'cajero' }, boss13.sessionToken);
+    const ana = (await call('__test_user_uid', { username: '2001' })).uid;
+    check(/^U-/.test(ana), '13) cada usuario tiene su identificador interno (no es el PIN)', ana);
+    const prods13 = JSON.stringify([await call('__test_get_product', { sku: 'BEB-0001' }), await call('__test_get_product', { sku: 'P1759000000000ABC' })]);
+    const pinCmd = { id: '77777777-aaaa-4bbb-8ccc-000000000001', type: 'user_save', payload: { uid: ana, old: { display_name: 'Ana', role: 'cajero', active: true }, display_name: 'Ana López', role: 'encargado', has_pin: true, pin: '2468' } };
+    check((await call('__test_apply_command', pinCmd)).status === 'aplicado', '13) la caja aplica el PIN nuevo y el rol');
+    check((await call('__test_apply_command', pinCmd)).status === 'aplicado', '13) la misma orden repetida no hace nada dos veces');
+    check((await call('__test_user_uid', { username: '2468' })).uid === ana, '13) es el mismo usuario con otro PIN');
+    check(!(await call('login', { code: '2001' })).sessionToken, '13) el PIN viejo ya no entra');
+    const stale13 = await call('__test_apply_command', { id: '77777777-aaaa-4bbb-8ccc-000000000002', type: 'user_save', payload: { uid: ana, old: { display_name: 'Ana', role: 'cajero', active: true }, display_name: 'Otra', role: 'cajero' } });
+    check(stale13.status === 'rechazado', '13) un cambio con datos viejos se rechaza', JSON.stringify(stale13));
+    const dupPin = await call('__test_apply_command', { id: '77777777-aaaa-4bbb-8ccc-000000000003', type: 'user_save', payload: { display_name: 'Beto', role: 'cajero', has_pin: true, pin: '1234' } });
+    check(dupPin.status === 'rechazado', '13) un PIN que ya usa otro usuario se rechaza', JSON.stringify(dupPin));
+    ({ page, errors, context } = await newPage(browser));
+    await page.evaluate(fakePrint);
+    await page.fill('#authCode', '2468');
+    await page.press('#authCode', 'Enter');
+    await page.waitForFunction(() => !document.body.classList.contains('locked'), null, { timeout: 8000 });
+    check(await page.evaluate(() => state.user && state.user.role === 'encargado' && state.user.displayName === 'Ana López'), '13) entra con el PIN nuevo, con su nombre y rol nuevos');
+    await openCash(page);
+    await sellByScan('111');
+    check((await stock('BEB-0001')) === 9, '13) cobra y descuenta exacto');
+    await page.evaluate(() => show('cashcut'));
+    await page.click('#cashCutXBtn');
+    await page.waitForTimeout(1200);
+    d = await dataNow();
+    check((d.cashCuts || []).some((c) => c.type === 'x' && c.total === 12.5), '13) hace su Corte X');
+    const off13 = await call('__test_apply_command', { id: '77777777-aaaa-4bbb-8ccc-000000000004', type: 'user_save', payload: { uid: ana, old: { display_name: 'Ana López', role: 'encargado', active: true }, display_name: 'Ana López', role: 'encargado', active: false } });
+    check(off13.status === 'aplicado', '13) la caja desactiva al usuario');
+    check(!(await call('login', { code: '2468' })).sessionToken, '13) un usuario desactivado ya no entra');
+    const lastAdmin = await call('__test_apply_command', { id: '77777777-aaaa-4bbb-8ccc-000000000005', type: 'user_save', payload: { uid: (await call('__test_user_uid', { username: '1234' })).uid, old: { role: 'admin', active: true }, display_name: 'Jefe', role: 'admin', active: false } });
+    check(lastAdmin.status === 'rechazado', '13) no deja la caja sin administrador activo', JSON.stringify(lastAdmin));
+    const after13 = JSON.parse(prods13); after13[0].stock -= 1;
+    const now13 = [await call('__test_get_product', { sku: 'BEB-0001' }), await call('__test_get_product', { sku: 'P1759000000000ABC' })];
+    check(JSON.stringify(now13.map((p) => [p.name, p.barcode, p.stock])) === JSON.stringify(after13.map((p) => [p.name, p.barcode, p.stock])), '13) productos, códigos y existencias intactos (solo bajó lo vendido)');
+    check(errors.length === 0, 'sin errores de JavaScript', errors.join(' | '));
+    await context.close();
+
     // Falla encontrada: con ~2 meses de historial la copia del navegador llenaba su límite y la app dejaba de abrir.
     console.log('\n10) Volumen: 7,000 ventas (~2 meses) y una copia vieja casi llena en el navegador');
     await seed();

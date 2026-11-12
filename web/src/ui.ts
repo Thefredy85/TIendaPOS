@@ -1,13 +1,13 @@
 import {
   createIcons, ArrowLeftRight, ArrowDownUp, Ban, Bell, Calculator, ChartColumn, Check, ChevronRight, Download, Eye, EyeOff, FileSpreadsheet, History, House, Info, KeyRound,
-  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, PackagePlus, Pencil, Receipt, Search, Settings, ShieldAlert, Store, Trash2,
+  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, PackagePlus, Pencil, Receipt, Search, Settings, ShieldAlert, ShieldCheck, Store, Trash2,
   Plus, Stethoscope, Tags, TriangleAlert, UserPlus, Users, X,
 } from 'lucide';
 
 // Solo los iconos que se usan (importar todos pesaba ~900 KB)
 const icons = {
   ArrowLeftRight, ArrowDownUp, Ban, Bell, Calculator, ChartColumn, Check, ChevronRight, Download, Eye, EyeOff, FileSpreadsheet, History, House, Info, KeyRound,
-  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, PackagePlus, Pencil, Receipt, Search, Settings, ShieldAlert, Store, Trash2,
+  LayoutGrid, LogIn, LogOut, MonitorSmartphone, Package, PackagePlus, Pencil, Receipt, Search, Settings, ShieldAlert, ShieldCheck, Store, Trash2,
   Plus, Stethoscope, Tags, TriangleAlert, UserPlus, Users, X,
 };
 

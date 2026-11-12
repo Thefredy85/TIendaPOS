@@ -97,6 +97,12 @@ fn truthy_opt(v: Option<&Value>) -> bool {
     matches!(v, Some(Value::Bool(true)))
 }
 
+// Identificador interno del usuario para la nube (v0.2.17). En la caja el "usuario" es el
+// mismo PIN con el que se entra, asi que nunca debe salir de la caja.
+fn new_user_uid() -> String {
+    format!("U-{}", random_text())
+}
+
 fn is_username(v: &str) -> bool {
     v.len() >= 4 && v.chars().all(|c| c.is_ascii_digit())
 }
@@ -347,6 +353,19 @@ fn outbox_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).unwrap_or(0)
 }
 
+// Usuarios creados antes de la v0.2.17: reciben su identificador interno. Solo agrega ese
+// dato; el PIN, el nombre, el rol y la contrasena no cambian.
+fn assign_user_uids(conn: &Connection) -> Result<(), String> {
+    for u in list_items(conn, "users") {
+        if clean_text(u.get("uid")).is_empty() {
+            let username = clean_text(u.get("username"));
+            if username.is_empty() { continue; }
+            patch_item(conn, "users", &username, &json!({"uid": new_user_uid()}))?;
+        }
+    }
+    Ok(())
+}
+
 // Cajas que ya hicieron su carga inicial antes de la v0.2.16: suben sus catalogos una vez.
 // Solo LEE los catalogos; no cambia ninguno.
 fn outbox_enqueue_catalogs(conn: &Connection) -> Result<(), String> {
@@ -564,6 +583,7 @@ fn create_user_record(conn: &Connection, input: &Value, role_fallback: &str) -> 
         "salt": salt,
         "role": normalize_role(&role),
         "pin": "",
+        "uid": new_user_uid(),
         "active": active,
         "createdAt": now_iso(),
         "lastLogin": ""
@@ -2161,9 +2181,12 @@ fn cloud_catalog(kind: &str, id: &str, c: &Value) -> Value {
 }
 
 fn cloud_user(u: &Value) -> Value {
+    // si el nombre quedo igual al PIN (usuario creado sin nombre), no se envia
+    let name = clean_text(u.get("displayName"));
+    let name = if name.is_empty() || name == clean_text(u.get("username")) { "Usuario sin nombre".to_string() } else { name };
     json!({
-        "username": clean_text(u.get("username")),
-        "display_name": opt_text(u.get("displayName")),
+        "username": clean_text(u.get("uid")),
+        "display_name": name,
         "role": opt_text(u.get("role")),
         "active": not_false(u.get("active"))
     })
@@ -2270,7 +2293,13 @@ fn build_push_batch(conn: &Connection, limit: usize) -> (Value, Vec<(String, Str
         let mark = |mut v: Value| { if deleted { v["deleted"] = json!(true); } v };
         match store.as_str() {
             "products" => { let mut v = cloud_product(&record); v["internal_id"] = json!(id); push(&mut batch, "products", mark(v)); }
-            "users" => { let mut v = cloud_user(&record); v["username"] = json!(id); push(&mut batch, "users", mark(v)); }
+            // el usuario viaja con su identificador interno (sin el, no se envia). Un borrado
+            // cuyo identificador sigue vivo es un cambio de PIN: no se manda como baja.
+            "users" => {
+                let uid = clean_text(record.get("uid"));
+                let still_alive = deleted && list_items(conn, "users").iter().any(|u| clean_text(u.get("uid")) == uid);
+                if !uid.is_empty() && !still_alive { push(&mut batch, "users", mark(cloud_user(&record))); }
+            }
             "moves" => { let mut v = cloud_movement(&record); v["id"] = json!(id); push(&mut batch, "movements", mark(v)); }
             // ventas y cortes nunca se borran en la caja
             "sales" if !deleted => push(&mut batch, "sales", cloud_sale(conn, &record)),
@@ -2476,6 +2505,100 @@ fn apply_product_create(conn: &Connection, cmd_id: &str, payload: &Value) -> Res
     Ok(true)
 }
 
+// Alta o edicion de un usuario de la caja desde el panel (v0.2.17). El PIN llega aparte
+// (la nube lo guarda donde el gestor no lo ve y lo borra al aplicar) y aqui solo se
+// guarda su hash. Nunca deja la caja sin un administrador activo.
+fn apply_user_save(conn: &Connection, cmd_id: &str, payload: &Value) -> Result<bool, String> {
+    if cmd_id.is_empty() { return Err("La orden no trae identificador".into()); }
+    let users = list_items(conn, "users");
+    if users.iter().any(|u| clean_text(u.get("panelCmd")) == cmd_id) { return Ok(false); }
+    let uid = clean_text(payload.get("uid"));
+    let name = clean_text(payload.get("display_name"));
+    if name.is_empty() { return Err("El nombre no puede quedar vacío".into()); }
+    if name.chars().count() > 80 { return Err("El nombre es demasiado largo".into()); }
+    let role = clean_text(payload.get("role")).to_lowercase();
+    if !["admin", "encargado", "cajero"].contains(&role.as_str()) { return Err("Rol no reconocido".into()); }
+    let pin = clean_text(payload.get("pin"));
+    if !pin.is_empty() && (!is_username(&pin) || pin.len() > 12) {
+        return Err("El PIN debe tener de 4 a 12 números".into());
+    }
+    if !pin.is_empty() && name == pin { return Err("El nombre no puede ser igual al PIN".into()); }
+    let active = payload.get("active").and_then(|v| v.as_bool());
+    let by = panel_user(payload);
+    if uid.is_empty() {
+        if pin.is_empty() { return Err("Falta el PIN del usuario nuevo".into()); }
+        if users.iter().any(|u| clean_text(u.get("username")) == pin) { return Err("Ese PIN ya lo usa otro usuario de la caja".into()); }
+        let salt = random_text();
+        create_item(conn, "users", &pin, &json!({
+            "username": pin, "displayName": name, "passwordHash": hash_password(&pin, &salt), "salt": salt,
+            "role": role, "pin": "", "uid": new_user_uid(), "active": active.unwrap_or(true),
+            "createdAt": now_iso(), "lastLogin": "", "panelCmd": cmd_id, "panelBy": by
+        }))?;
+    } else {
+        let cur = users.iter().find(|u| clean_text(u.get("uid")) == uid).cloned().ok_or("Ese usuario ya no existe en la caja")?;
+        // lo que vio el panel debe seguir igual en la caja
+        let old = payload.get("old").cloned().unwrap_or_else(|| json!({}));
+        let changed_here = (old.get("display_name").is_some() && clean_text(old.get("display_name")) != clean_text(cur.get("displayName")))
+            || (old.get("role").is_some() && clean_text(old.get("role")) != clean_text(cur.get("role")))
+            || (old.get("active").and_then(|v| v.as_bool()).is_some_and(|a| a != not_false(cur.get("active"))));
+        if changed_here { return Err("Ese usuario cambió en la caja mientras la orden esperaba; vuelve a intentarlo".into()); }
+        let old_username = clean_text(cur.get("username"));
+        let new_username = if pin.is_empty() { old_username.clone() } else { pin.clone() };
+        if new_username != old_username && users.iter().any(|u| clean_text(u.get("username")) == new_username) {
+            return Err("Ese PIN ya lo usa otro usuario de la caja".into());
+        }
+        let mut rec = cur.clone();
+        rec["username"] = json!(new_username);
+        rec["displayName"] = json!(name);
+        rec["role"] = json!(role);
+        if let Some(a) = active { rec["active"] = json!(a); }
+        if !pin.is_empty() {
+            let salt = random_text();
+            rec["salt"] = json!(salt);
+            rec["passwordHash"] = json!(hash_password(&pin, &salt));
+        }
+        rec["panelCmd"] = json!(cmd_id);
+        rec["panelBy"] = json!(by);
+        create_item(conn, "users", &new_username, &rec)?;
+        if new_username != old_username { delete_item(conn, "users", &old_username)?; }
+    }
+    if !list_items(conn, "users").iter().any(|u| not_false(u.get("active")) && clean_text(u.get("role")) == "admin") {
+        return Err("La caja quedaría sin ningún administrador activo".into());
+    }
+    Ok(true)
+}
+
+// Permisos por rol desde el panel. Solo encargado y cajero (admin siempre tiene todo).
+fn apply_role_permissions(conn: &Connection, payload: &Value) -> Result<bool, String> {
+    let after = payload.get("after").and_then(|v| v.as_object()).cloned().ok_or("La orden no trae los permisos")?;
+    let before = payload.get("before").cloned().unwrap_or_else(|| json!({}));
+    let current = read_role_permissions(conn);
+    let mut next = current.clone();
+    let mut differs = false;
+    for (role, keys) in &after {
+        if !PERM_ROLES.contains(&role.as_str()) { return Err(format!("Rol no permitido: {}", role)); }
+        let keys = keys.as_object().ok_or("Permisos mal formados")?;
+        for (key, val) in keys {
+            if !PERM_KEYS.contains(&key.as_str()) { return Err(format!("Permiso no reconocido: {}", key)); }
+            let v = val.as_bool().ok_or("Permisos mal formados")?;
+            if current[role.as_str()][key.as_str()].as_bool() != Some(v) { differs = true; }
+            next[role.as_str()][key.as_str()] = json!(v);
+        }
+    }
+    if !differs { return Ok(false); }
+    for (role, keys) in after.iter() {
+        for key in keys.as_object().map(|k| k.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+            if let Some(was) = before.get(role).and_then(|r| r.get(&key)).and_then(|v| v.as_bool()) {
+                if current[role.as_str()][key.as_str()].as_bool() != Some(was) {
+                    return Err("Los permisos cambiaron en la caja mientras la orden esperaba; vuelve a intentarlo".into());
+                }
+            }
+        }
+    }
+    create_item(conn, "role_permissions", "current", &next)?;
+    Ok(true)
+}
+
 // Campo del producto que guarda el nombre de cada catalogo
 fn catalog_product_field(kind: &str) -> Option<&'static str> {
     match kind {
@@ -2568,6 +2691,8 @@ fn apply_command(conn: &Connection, cmd: &Value) -> (&'static str, String) {
         "product_active" => all_or_nothing(conn, || { changed = apply_product_active(conn, &payload)?; Ok(()) }),
         "product_create" => all_or_nothing(conn, || { changed = apply_product_create(conn, &cmd_id, &payload)?; Ok(()) }),
         "catalog_save" => all_or_nothing(conn, || { changed = apply_catalog_save(conn, &cmd_id, &payload)?; Ok(()) }),
+        "user_save" => all_or_nothing(conn, || { changed = apply_user_save(conn, &cmd_id, &payload)?; Ok(()) }),
+        "role_permissions" => all_or_nothing(conn, || { changed = apply_role_permissions(conn, &payload)?; Ok(()) }),
         other => Err(format!("Esta versión de la app no conoce la orden \"{}\"", other)),
     }.map(|_| changed);
     match outcome {
@@ -2707,6 +2832,15 @@ fn cloud_step(app: &tauri::AppHandle, force_heartbeat: bool) -> Result<(), Strin
         with_db(app, |conn| {
             if outbox_enqueue_catalogs(conn).is_ok() {
                 save_cloud_state(conn, &json!({"catalogsLoadDone": true}));
+            }
+        });
+    }
+
+    // 3a'. usuarios sin identificador interno (antes de la v0.2.17): se les asigna una vez
+    if !truthy_opt(state.get("usersUidDone")) {
+        with_db(app, |conn| {
+            if assign_user_uids(conn).is_ok() {
+                save_cloud_state(conn, &json!({"usersUidDone": true}));
             }
         });
     }
@@ -3027,6 +3161,108 @@ mod tests {
         assert_eq!(k["rows"].as_array().unwrap().len(), 0);
         assert!(dispatch("product_kardex", &json!({}), &t, &conn, &mut s).is_err());
         assert!(dispatch("product_kardex", &json!({"sku":"BEB-0001"}), "token-falso", &conn, &mut s).is_err());
+    }
+
+    // ---------- usuarios desde el panel (v0.2.17) ----------
+    fn user_cmd(id: &str, payload: Value) -> Value { json!({"id": id, "type": "user_save", "payload": payload}) }
+    fn uid_of(conn: &Connection, username: &str) -> String { clean_text(get_item(conn, "users", username).unwrap().get("uid")) }
+    fn can_login(conn: &Connection, s: &mut HashMap<String, Session>, code: &str) -> bool {
+        dispatch("login", &json!({"code": code}), "", conn, s).map(|r| r.get("sessionToken").is_some()).unwrap_or(false)
+    }
+
+    #[test]
+    fn el_pin_nunca_sale_de_la_caja_y_las_cajas_viejas_reciben_identificador() {
+        let (conn, mut s, t) = fresh();
+        // usuario de una caja vieja: sin identificador
+        let mut old = get_item(&conn, "users", "1234").unwrap();
+        old.as_object_mut().unwrap().remove("uid");
+        create_item(&conn, "users", "1234", &old).unwrap();
+        clear_outbox(&conn);
+        outbox_enqueue_all(&conn).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        assert_eq!(batch["users"].as_array().unwrap().len(), 0, "sin identificador no se envía");
+        let hash = clean_text(old.get("passwordHash"));
+        assign_user_uids(&conn).unwrap();
+        let now = get_item(&conn, "users", "1234").unwrap();
+        assert!(clean_text(now.get("uid")).starts_with("U-"));
+        assert_eq!(clean_text(now.get("passwordHash")), hash, "el PIN y la contraseña no cambian");
+        assert!(can_login(&conn, &mut s, "1234"));
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        let text = batch.to_string();
+        assert!(!text.contains("\"1234\""), "{}", text);
+        assert_eq!(batch["users"][0]["display_name"], "Admin");
+        // un usuario sin nombre (queda igual a su PIN) no manda el PIN como nombre
+        dispatch("save_user", &json!({"username":"5678","password":"5678","role":"cajero"}), &t, &conn, &mut s).unwrap();
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        assert!(!batch.to_string().contains("5678"));
+    }
+
+    #[test]
+    fn alta_y_cambios_de_usuario_desde_el_panel() {
+        let (conn, mut s, t) = fresh();
+        put(&conn, "BEB-0001", "111", "Agua", 12.0, 10.0);
+        let before = list_items(&conn, "products");
+        // alta
+        let alta = user_cmd("88888888-aaaa-4bbb-8ccc-000000000001", json!({"display_name":"Rosa","role":"cajero","pin":"4321","by":"dueno@x.com"}));
+        assert_eq!(apply_command(&conn, &alta), ("aplicado", String::new()));
+        assert_eq!(apply_command(&conn, &alta).0, "aplicado", "repetida: no crea otra");
+        assert_eq!(list_items(&conn, "users").len(), 2);
+        assert!(can_login(&conn, &mut s, "4321"));
+        let rosa = uid_of(&conn, "4321");
+        // PIN repetido, PIN corto y sin nombre se rechazan
+        assert!(apply_command(&conn, &user_cmd("88888888-aaaa-4bbb-8ccc-000000000002", json!({"display_name":"Otro","role":"cajero","pin":"1234"}))).1.contains("PIN ya lo usa"));
+        assert!(apply_command(&conn, &user_cmd("88888888-aaaa-4bbb-8ccc-000000000003", json!({"display_name":"Otro","role":"cajero","pin":"12"}))).1.contains("PIN debe"));
+        assert!(apply_command(&conn, &user_cmd("88888888-aaaa-4bbb-8ccc-000000000004", json!({"display_name":" ","role":"cajero","pin":"9999"}))).1.contains("vacío"));
+        // cambiar PIN: el viejo deja de servir y su sesión se cierra; el identificador se conserva
+        let tok = dispatch("login", &json!({"code":"4321"}), "", &conn, &mut s).unwrap()["sessionToken"].as_str().unwrap().to_string();
+        let pin = user_cmd("88888888-aaaa-4bbb-8ccc-000000000005", json!({"uid": rosa, "old": {"display_name":"Rosa","role":"cajero","active":true}, "display_name":"Rosa M.","role":"encargado","pin":"7777"}));
+        assert_eq!(apply_command(&conn, &pin), ("aplicado", String::new()));
+        assert!(!can_login(&conn, &mut s, "4321"));
+        assert!(can_login(&conn, &mut s, "7777"));
+        assert!(dispatch("data", &json!({}), &tok, &conn, &mut s).is_err(), "la sesión con el PIN viejo se cierra");
+        let r = get_item(&conn, "users", "7777").unwrap();
+        assert_eq!((clean_text(r.get("uid")), clean_text(r.get("displayName")), clean_text(r.get("role"))), (rosa.clone(), "Rosa M.".to_string(), "encargado".to_string()));
+        assert!(get_item(&conn, "users", "4321").is_none());
+        // el cambio de PIN no viaja como baja
+        let (batch, _) = build_push_batch(&conn, PUSH_BATCH);
+        let mine: Vec<&Value> = batch["users"].as_array().unwrap().iter().filter(|u| u["username"] == json!(rosa)).collect();
+        assert!(mine.iter().all(|u| u.get("deleted").is_none()), "{:?}", mine);
+        assert!(!batch.to_string().contains("7777") && !batch.to_string().contains("4321"));
+        // si cambió en la caja mientras esperaba, se rechaza
+        let stale = user_cmd("88888888-aaaa-4bbb-8ccc-000000000006", json!({"uid": rosa, "old": {"display_name":"Rosa","role":"cajero"}, "display_name":"X","role":"cajero"}));
+        assert!(apply_command(&conn, &stale).1.contains("cambió en la caja"));
+        // desactivar: ya no entra, se conserva
+        let off = user_cmd("88888888-aaaa-4bbb-8ccc-000000000007", json!({"uid": rosa, "old": {"active":true}, "display_name":"Rosa M.","role":"encargado","active":false}));
+        assert_eq!(apply_command(&conn, &off).0, "aplicado");
+        assert!(!can_login(&conn, &mut s, "7777"));
+        assert!(get_item(&conn, "users", "7777").is_some());
+        // nunca sin administrador activo
+        let admin = uid_of(&conn, "1234");
+        let why = apply_command(&conn, &user_cmd("88888888-aaaa-4bbb-8ccc-000000000008", json!({"uid": admin, "display_name":"Admin","role":"cajero"}))).1;
+        assert!(why.contains("administrador"), "{}", why);
+        assert_eq!(clean_text(get_item(&conn, "users", "1234").unwrap().get("role")), "admin", "todo o nada");
+        assert!(can_login(&conn, &mut s, "1234"));
+        // productos intactos y se sigue cobrando
+        assert_eq!(before, list_items(&conn, "products"));
+        dispatch("open_cash_register", &json!({"openingAmount":0}), &t, &conn, &mut s).unwrap();
+        dispatch("checkout", &json!({"clientId":"S-U","items":[{"sku":"BEB-0001","qty":1}],"payments":{"Efectivo":12.0}}), &t, &conn, &mut s).unwrap();
+        assert_eq!(stock_of(&conn, "BEB-0001"), 9.0);
+    }
+
+    #[test]
+    fn permisos_desde_el_panel() {
+        let (conn, mut s, t) = fresh();
+        let cmd = |id: &str, before: Value, after: Value| json!({"id": id, "type": "role_permissions", "payload": {"before": before, "after": after}});
+        assert_eq!(apply_command(&conn, &cmd("p1", json!({"cajero":{"products":false}}), json!({"cajero":{"products":true}}))).0, "aplicado");
+        let p = read_role_permissions(&conn);
+        assert_eq!((p["cajero"]["products"].clone(), p["cajero"]["cashcut"].clone(), p["encargado"]["products"].clone()), (json!(true), json!(true), json!(true)));
+        // repetida: no hace nada
+        assert_eq!(apply_command(&conn, &cmd("p1", json!({"cajero":{"products":false}}), json!({"cajero":{"products":true}}))).0, "aplicado");
+        // vieja (en la caja ya cambió) se rechaza
+        dispatch("save_role_permissions", &json!({"permissions":{"cajero":{"products":false,"cashcut":true},"encargado":{}}}), &t, &conn, &mut s).unwrap();
+        assert!(apply_command(&conn, &cmd("p2", json!({"cajero":{"cashcut":false}}), json!({"cajero":{"cashcut":true,"settings":true}}))).1.contains("cambiaron"));
+        assert!(apply_command(&conn, &cmd("p3", json!({}), json!({"admin":{"products":false}}))).1.contains("no permitido"));
+        assert!(apply_command(&conn, &cmd("p4", json!({}), json!({"cajero":{"checkout":false}}))).1.contains("no reconocido"));
     }
 
     // ---------- catalogos desde el panel (v0.2.16) ----------
@@ -3612,7 +3848,9 @@ mod tests {
         let text = batch.to_string();
         assert!(!text.contains(&hash) && !text.contains(&salt));
         assert!(!text.contains("passwordHash") && !text.contains("\"salt\"") && !text.contains("\"pin\""));
-        assert_eq!(batch["users"][0]["username"], "1234");
+        // el usuario viaja con su identificador, nunca con el PIN
+        assert!(clean_text(batch["users"][0].get("username")).starts_with("U-"));
+        assert!(!text.contains("\"1234\""), "el PIN no sale de la caja");
         let sale = &batch["sales"][0];
         assert_eq!(sale["cancelled"], true);
         // la linea no traia codigo ni costo: se completan con el producto
@@ -3912,6 +4150,11 @@ mod tests {
                 "__test_get_product" => {
                     let sku = clean_text(payload.get("sku"));
                     get_item(&conn, "products", &sku).unwrap_or(json!(null))
+                }
+                // identificador interno de un usuario (lo que conoce el panel), sin datos de su PIN
+                "__test_user_uid" => {
+                    let username = clean_text(payload.get("username"));
+                    json!({"uid": get_item(&conn, "users", &username).map(|u| clean_text(u.get("uid"))).unwrap_or_default()})
                 }
                 _ => match dispatch(&op, &payload, &token, &conn, &mut sessions) {
                     Ok(v) => v,

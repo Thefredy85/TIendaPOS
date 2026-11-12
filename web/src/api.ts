@@ -207,6 +207,10 @@ export interface RemotePayload {
   barcode?: string; name?: string; category?: string; cost?: number; price?: number; min_stock?: number;
   // catalog_save
   kind?: CatalogKind; id?: string; old_name?: string; description?: string; abbreviation?: string; phone?: string; notes?: string;
+  // user_save (el PIN nunca viene aquí: solo has_pin) y role_permissions
+  uid?: string; display_name?: string; role?: string; has_pin?: boolean;
+  old?: { display_name?: string; role?: string; active?: boolean };
+  // role_permissions usa before/after con la forma { rol: { permiso: bool } }
 }
 export interface RemoteChange {
   id: string; type: string; status: 'pendiente' | 'aplicado' | 'rechazado' | 'cancelado';
@@ -296,13 +300,31 @@ export async function productMovements(businessId: string, internalId: string, l
 
 // ---------- usuarios del POS y permisos (solo lectura) ----------
 
-// Sin el usuario: en la caja el usuario ES el PIN de acceso, y no debe mostrarse ni descargarse.
-export interface PosUser { display_name: string | null; role: string | null; active: boolean | null }
+// En la caja el usuario ES el PIN de acceso: nunca se muestra ni se descarga. Desde la
+// v0.2.17 la caja sube un identificador interno ("U-…") que sí se puede usar (uid).
+export interface PosUser { uid: string | null; display_name: string | null; role: string | null; active: boolean | null }
 export type RolePermissions = Record<string, Record<string, boolean>>;
 
-export async function listPosUsers(businessId: string): Promise<PosUser[]> {
-  return check(await sb.from('pos_users').select('display_name, role, active')
+export async function listPosUsers(businessId: string): Promise<{ users: PosUser[]; canEdit: boolean }> {
+  const safe = check(await sb.from('pos_users').select('username, display_name, role, active')
+    .eq('business_id', businessId).is('deleted_at', null).like('username', 'U-%').order('display_name'));
+  if (safe.length) {
+    return { users: safe.map((u) => ({ uid: u.username as string, display_name: u.display_name, role: u.role, active: u.active })), canEdit: true };
+  }
+  // caja vieja: filas con el PIN como usuario; solo se leen nombre, rol y estado
+  const old = check(await sb.from('pos_users').select('display_name, role, active')
     .eq('business_id', businessId).is('deleted_at', null).order('display_name'));
+  return { users: old.map((u) => ({ uid: null, ...u })) as PosUser[], canEdit: false };
+}
+export interface PosUserOld { display_name?: string | null; role?: string | null; active?: boolean | null }
+export async function saveCajaUser(businessId: string, uid: string | null, old: PosUserOld | null, displayName: string,
+  role: string, active: boolean | null, pin: string | null): Promise<string> {
+  return check(await sb.rpc('panel_save_pos_user', {
+    p_business_id: businessId, p_uid: uid, p_old: old, p_display_name: displayName, p_role: role, p_active: active, p_pin: pin,
+  })) as string;
+}
+export async function saveRolePermissions(businessId: string, before: RolePermissions, after: RolePermissions): Promise<string> {
+  return check(await sb.rpc('panel_save_role_permissions', { p_business_id: businessId, p_before: before, p_after: after })) as string;
 }
 
 export async function getRolePermissions(businessId: string): Promise<RolePermissions | null> {

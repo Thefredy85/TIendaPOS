@@ -28,7 +28,9 @@ export function fieldValue(k: keyof ProductFields, v: string | number | undefine
 export const changedKeys = (after: ProductFields) => Object.keys(after) as (keyof ProductFields)[];
 
 const MOVE_TEXT: Record<MoveType, string> = { entrada_compra: 'Entrada por compra', salida_manual: 'Salida manual', merma: 'Merma' };
-const KNOWN = ['product_edit', 'stock_move', 'product_active', 'product_create', 'catalog_save'];
+const KNOWN = ['product_edit', 'stock_move', 'product_active', 'product_create', 'catalog_save', 'user_save', 'role_permissions'];
+const ROLE_ONE: Record<string, string> = { admin: 'Administrador', encargado: 'Encargado', cajero: 'Cajero' };
+const PERM_ONE: Record<string, string> = { settings: 'Configuración', catalogs: 'Catálogos', products: 'Productos', movements: 'Entradas y salidas', counts: 'Conteos', cashcut: 'Cortes' };
 const CATALOG_ONE: Record<string, string> = { category: 'Categoría', presentation: 'Presentación', unit: 'Unidad', supplier: 'Proveedor' };
 
 // Qué dice cada cambio en una línea
@@ -49,6 +51,26 @@ function describe(c: RemoteChange): string {
       if (p[k] !== undefined && p[k] !== '') parts.push(`${l}: ${p[k]}`);
     }
     return `${CATALOG_ONE[p.kind ?? ''] ?? 'Catálogo'} · ${parts.join(' · ') || 'Datos'}`;
+  }
+  // El PIN nunca viaja en la orden: solo se dice si se cambió
+  if (c.type === 'user_save') {
+    const o = p.old ?? {}; const parts: string[] = [];
+    if (!p.uid) parts.push(`Alta · ${ROLE_ONE[p.role ?? ''] ?? p.role}`);
+    else {
+      if (o.display_name !== undefined && o.display_name !== p.display_name) parts.push(`Nombre ${o.display_name ?? '—'} → ${p.display_name}`);
+      if (o.role !== undefined && o.role !== p.role) parts.push(`Rol ${ROLE_ONE[o.role] ?? o.role} → ${ROLE_ONE[p.role ?? ''] ?? p.role}`);
+    }
+    if (p.has_pin) parts.push(p.uid ? 'PIN nuevo' : 'con PIN');
+    if (p.active === false) parts.push('Desactivar');
+    if (p.active === true) parts.push('Activar');
+    return `Usuario de la caja · ${parts.join(' · ') || 'Datos'}`;
+  }
+  if (c.type === 'role_permissions') {
+    const parts: string[] = [];
+    for (const [r, keys] of Object.entries((p.after ?? {}) as Record<string, Record<string, boolean>>)) {
+      for (const [k, v] of Object.entries(keys)) parts.push(`${ROLE_ONE[r] ?? r} · ${PERM_ONE[k] ?? k}: ${v ? 'Sí' : 'No'}`);
+    }
+    return parts.join(' · ');
   }
   if (c.type === 'product_create') return `Alta · código ${p.barcode ?? '—'} · ${p.category ?? ''} · costo ${fmtMoney(Number(p.cost ?? 0))} · precio ${fmtMoney(Number(p.price ?? 0))}`;
   return changedKeys(p.after).map((k) => `${FIELD_LABEL[k]} ${fieldValue(k, p.before[k])} → ${fieldValue(k, p.after[k])}`).join(' · ');
@@ -81,7 +103,9 @@ export async function renderModificados(ctx: Ctx, el: HTMLElement) {
     // Un "deshacer" no se puede deshacer: se encadenaría sin querer. Para volver al valor, se edita de nuevo.
     const canUndo = (c: RemoteChange) => ctx.canManageDevices && c.status === 'aplicado' && !undone.has(c.id) && !c.payload.undo_of
       && (c.type === 'stock_move' || (c.type === 'product_edit' && !busy.has(c.payload.internal_id)));
-    const title = (c: RemoteChange) => c.type === 'product_create' || c.type === 'catalog_save' ? (c.payload.name ?? 'Producto nuevo')
+    const title = (c: RemoteChange) => c.type === 'user_save' ? (c.payload.display_name ?? 'Usuario')
+      : c.type === 'role_permissions' ? 'Permisos por rol'
+      : c.type === 'product_create' || c.type === 'catalog_save' ? (c.payload.name ?? 'Producto nuevo')
       : names.get(c.payload.internal_id) ?? 'Producto ya no disponible';
 
     el.innerHTML = `${!canApply && ctx.canManageDevices ? `<div class="banner wait">${icon('shield-alert')}<span class="small">${esc(OLD_APP_NOTICE)}</span></div>` : ''}

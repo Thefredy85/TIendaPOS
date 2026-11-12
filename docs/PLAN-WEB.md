@@ -74,7 +74,12 @@ Paso 3 en la v0.2.16 (migración `20261111000100_catalogos.sql`):
 - [x] La caja sube categorías, presentaciones, unidades y proveedores (`pos_catalogs`; las cajas que ya tenían la carga inicial los suben una vez).
 - [x] Sección **Catálogos**: alta, editar datos, activar/desactivar y renombrar (`catalog_save`). Al renombrar, la caja cambia ese campo en los productos que lo usan (nunca precio, código ni existencia), todo o nada, y rechaza nombres repetidos o un nombre que cambió en la caja. No se borra desde el panel.
 - [x] "Nuevo producto" y "Editar" usan la lista real de categorías de la caja.
-- [ ] Usuarios de la caja desde el panel (0.2.18).
+Paso 4 en la v0.2.17 (migración `20261112000000_usuarios_panel.sql`):
+- [x] En la caja el usuario ES el PIN. Cada usuario recibe un identificador interno `uid` ("U-…", no secreto) y la caja sube ese uid a `pos_users` en lugar del PIN (las cajas ya conectadas lo hacen una vez, `usersUidDone`). El inicio de sesión no cambia.
+- [x] Sección **Usuarios**: alta (nombre, PIN que escribe el dueño, rol), editar nombre y rol, cambiar PIN (cierra su sesión) y activar/desactivar (`user_save`). No se borra desde el panel. Rol administrador con aviso; nunca deja la caja sin un administrador activo. Rechaza PIN repetido y cambios sobre datos que ya cambiaron en la caja.
+- [x] Permisos por rol (encargado y cajero) editables (`role_permissions`), con revisión antes de enviar.
+- [x] El PIN nunca va en `pos_commands` (la lee el gestor): viaja en `pos_command_secrets` (sin acceso desde el panel), la caja lo recibe dentro de su orden y se borra en cuanto la orden se aplica, se rechaza o se cancela.
+- [ ] Cuando DELFOS tenga la 0.2.17: borrar de la nube las 4 filas viejas de `pos_users` que tenían el PIN como usuario (con autorización) y cambiar esos PIN.
 
 - La web nunca escribe en la base de la tienda. Inserta **órdenes** en `pos_commands`: tipo, datos, quién y cuándo.
 - La app las descarga al tener internet, las aplica en orden, valida (por ejemplo, rechaza un código de barras duplicado) y confirma con `aplicado` o `rechazado` más el motivo.
