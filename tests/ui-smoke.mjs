@@ -881,8 +881,11 @@ async function main() {
       await page.selectOption('#moveSku', sku);
       await page.fill('#moveQty', String(qty));
     };
-    // merma sin motivo: no se registra
+    // v0.2.20: en Entrada/Salida/Merma el producto se ve con su código antes del nombre
     await pick16('FLA-0001', 9, 'merma');
+    const opt16 = await page.locator('#moveSku option:checked').innerText();
+    check(/^7501020510041 · Flan lala · .* · existencia 9$/.test(opt16), '16) el producto se elige con su código antes del nombre', opt16);
+    // merma sin motivo: no se registra
     await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
     await page.waitForTimeout(500);
     check((await stock('FLA-0001')) === 9 && (await page.locator('#confirmDialog[open]').count()) === 0, '16) una merma sin motivo no se registra');
@@ -891,7 +894,7 @@ async function main() {
     await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
     await page.waitForSelector('#confirmDialog[open]', { timeout: 4000 }).catch(() => {});
     const conf16 = await page.locator('#confirmMessage').innerText().catch(() => '');
-    check(/Merma de 9/.test(conf16) && /de 9 a 0/.test(conf16) && /Flan lala/.test(conf16), '16) la merma pide confirmar con producto, cantidad y existencia (9 → 0)', conf16);
+    check(/Merma de 9/.test(conf16) && /de 9 a 0/.test(conf16) && /7501020510041 · "Flan lala"/.test(conf16), '16) la merma pide confirmar con producto, cantidad y existencia (9 → 0)', conf16);
     await page.click('#cancelConfirmBtn');
     await page.waitForTimeout(300);
     check((await stock('FLA-0001')) === 9 && (await moves16('FLA-0001')).length === 0, '16) al cancelar no se registra nada');
@@ -900,7 +903,7 @@ async function main() {
     await page.evaluate(() => document.getElementById('movementForm').requestSubmit());
     await page.waitForFunction(() => /Flan lala/.test(document.getElementById('moveResult')?.textContent || ''), null, { timeout: 6000 }).catch(() => {});
     const res16 = await page.locator('#moveResult').innerText().catch(() => '');
-    check((await stock('FLA-0001')) === 17 && /Entrada/.test(res16) && /\+8/.test(res16) && /17/.test(res16), '16) al guardar se ve en grande: "Entrada: Flan lala +8 → existencia 17"', res16);
+    check((await stock('FLA-0001')) === 17 && /Entrada/.test(res16) && /7501020510041 Flan lala/.test(res16) && /\+8/.test(res16) && /17/.test(res16), '16) al guardar se ve en grande: "Entrada: Flan lala +8 → existencia 17"', res16);
     // merma confirmada: queda con motivo y usuario
     await pick16('FLA-0001', 2, 'merma');
     await page.fill('#moveReason', 'Caducado');
